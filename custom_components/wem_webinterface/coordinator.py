@@ -15,6 +15,7 @@ import asyncio
 import ipaddress
 import logging
 import platform
+import re
 import socket
 import subprocess
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ from .const import (
     DEFAULT_CYCLE_INTERVAL,
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_WRITE_RETRIES,
+    DEFAULT_INITIAL_ENTRIES,
     DEFAULT_RETRY_INTERVAL,
 )
 from .parser import ParsedParameter, is_login_page, parse_settings_page
@@ -191,6 +193,14 @@ class WemCoordinator:
 
             if not self.entries:
                 added = await self._bootstrap_entries_from_home()
+                if added == 0:
+                    self.entries = list(DEFAULT_INITIAL_ENTRIES)
+                    _LOGGER.warning(
+                        "Bootstrap found no menu links for host=%s; falling back to default initial entries (%d stacks)",
+                        self.ip_address,
+                        len(self.entries),
+                    )
+                    added = len(self.entries)
                 _LOGGER.info(
                     "Initial bootstrap after login finished for host=%s: added=%d total_entries=%d",
                     self.ip_address,
@@ -605,6 +615,18 @@ class WemCoordinator:
                 _LOGGER.warning(
                     "Initialization scan could not bootstrap entries from home page: %s",
                     exc,
+                )
+
+            if not queue:
+                self.entries = list(DEFAULT_INITIAL_ENTRIES)
+                queue = list(self.entries)
+                known = set(self.entries)
+                attempts = {stack: 0 for stack in queue}
+                root_entries = list(queue)
+                root_index = {stack: idx + 1 for idx, stack in enumerate(root_entries)}
+                _LOGGER.warning(
+                    "Initialization scan bootstrap found no menu links; falling back to default initial entries (%d stacks)",
+                    len(queue),
                 )
 
         try:
@@ -1025,21 +1047,36 @@ def _parse_entries(raw: str) -> List[str]:
 
 
 def _extract_stack_links_from_html(html: str) -> List[str]:
-    """Extract all stack values from settings_export links in a page."""
+    """Extract stack values from any page markup that references `stack=`.
+
+    The WEM UI sometimes renders navigation entries as normal links, but on
+    some firmware versions the same targets appear in onclick handlers,
+    hidden form actions, or inline scripts instead of plain <a href> tags.
+    """
     soup = BeautifulSoup(html, "lxml")
     found: List[str] = []
     seen: set[str] = set()
 
-    for anchor in soup.find_all("a", href=True):
-        href = anchor.get("href", "")
-        if "settings_export.html" not in href or "stack=" not in href:
-            continue
-        parsed = urlparse(href)
-        query = parse_qs(parsed.query)
-        for raw_stack in query.get("stack", []):
-            stack = unquote(raw_stack).strip()
-            if stack and stack not in seen:
-                seen.add(stack)
-                found.append(stack)
+    def _add_stack(raw_stack: str) -> None:
+        stack = unquote(raw_stack).strip()
+        if stack and stack not in seen:
+            seen.add(stack)
+            found.append(stack)
+
+    # 1) Structured URLs in all tag attributes.
+    for tag in soup.find_all(True):
+        for attr_value in tag.attrs.values():
+            values = attr_value if isinstance(attr_value, list) else [attr_value]
+            for value in values:
+                if not isinstance(value, str) or "stack=" not in value:
+                    continue
+                parsed = urlparse(value)
+                query = parse_qs(parsed.query)
+                for raw_stack in query.get("stack", []):
+                    _add_stack(raw_stack)
+
+    # 2) Raw HTML fallback for inline scripts / unusual markup.
+    for match in re.finditer(r"stack=([^\"'&<>\s]+)", html):
+        _add_stack(match.group(1))
 
     return found
