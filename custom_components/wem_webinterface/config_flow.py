@@ -21,6 +21,7 @@ from .const import (
     CONF_IP_ADDRESS,
     CONF_MAX_RETRIES,
     CONF_PASSWORD,
+    CONF_REDISCOVER_STACK,
     CONF_RETRY_INTERVAL,
     CONF_USERNAME,
     DEFAULT_CYCLE_INTERVAL,
@@ -399,6 +400,15 @@ class WemOptionsFlow(config_entries.OptionsFlow):
         opts = self.config_entry.options
         data = self.config_entry.data
         entries_default = str(opts.get(CONF_ENTRIES, data.get(CONF_ENTRIES, "")) or "")
+        entry_lines = _parse_entries(entries_default)
+        rediscover_default = str(opts.get(CONF_REDISCOVER_STACK, "") or "")
+        rediscover_options = [
+            selector.SelectOptionDict(value="", label=""),
+            *[
+                selector.SelectOptionDict(value=entry_value, label=entry_value)
+                for entry_value in entry_lines
+            ],
+        ]
         options_schema = vol.Schema(
             {
                 vol.Optional(
@@ -426,6 +436,17 @@ class WemOptionsFlow(config_entries.OptionsFlow):
                     CONF_ENTRIES,
                     default=entries_default,
                 ): selector.TextSelector(selector.TextSelectorConfig(multiline=True)),
+                vol.Optional(
+                    CONF_REDISCOVER_STACK,
+                    default=rediscover_default,
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=rediscover_options,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                        custom_value=False,
+                        sort=False,
+                    )
+                ),
                 vol.Optional(
                     CONF_INIT_SCAN_NOW,
                     default=False,
@@ -485,6 +506,7 @@ class WemOptionsFlow(config_entries.OptionsFlow):
             data = dict(self._pending_options_input)
             data[CONF_ENTRIES] = "\n".join(self._manual_scan_result.get("entries", []))
             data[CONF_INIT_SCAN_NOW] = False
+            data[CONF_REDISCOVER_STACK] = str(data.get(CONF_REDISCOVER_STACK, "") or "")
             return self.async_create_entry(title="", data=data)
 
         return self.async_show_form(
@@ -502,6 +524,7 @@ class WemOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None and self._pending_options_input is not None:
             data = dict(self._pending_options_input)
             data[CONF_INIT_SCAN_NOW] = False
+            data[CONF_REDISCOVER_STACK] = str(data.get(CONF_REDISCOVER_STACK, "") or "")
             return self.async_create_entry(title="", data=data)
 
         return self.async_show_form(

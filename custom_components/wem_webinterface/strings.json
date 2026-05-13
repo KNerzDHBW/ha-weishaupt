@@ -45,6 +45,7 @@
           "retry_interval": "Retry interval when the page is incomplete (seconds)",
           "max_retries": "Maximum retries",
           "entries": "Stack entries (one entry per line)",
+          "rediscover_stack": "Rediscover one existing entry",
           "init_scan_now": "Read all entries now (one-time full menu scan)",
           "init_scan_interval": "Scan interval between page loads (seconds, minimum 5)",
           "init_scan_max_entries": "Maximum entries to scan"

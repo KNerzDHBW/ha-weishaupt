@@ -45,6 +45,7 @@
           "retry_interval": "Wiederholungsintervall bei unvollständiger Seite (Sekunden)",
           "max_retries": "Maximale Wiederholungsversuche",
           "entries": "Stack-Einträge (eine Zeile pro Eintrag)",
+          "rediscover_stack": "Einen vorhandenen Eintrag neu einlesen",
           "init_scan_now": "Jetzt alle Einträge einlesen (einmaliger vollständiger Menü-Scan)",
           "init_scan_interval": "Scan-Intervall zwischen Seitenabrufen (Sekunden, mindestens 5)",
           "init_scan_max_entries": "Maximal zu scannende Einträge"

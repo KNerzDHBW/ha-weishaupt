@@ -32,6 +32,7 @@ from .const import (
     CONF_IP_ADDRESS,
     CONF_MAX_RETRIES,
     CONF_PASSWORD,
+    CONF_REDISCOVER_STACK,
     CONF_RETRY_INTERVAL,
     CONF_USERNAME,
     CONF_ENTRIES,
@@ -107,6 +108,7 @@ class WemCoordinator:
         self._write_event = asyncio.Event()
         self._write_queue: asyncio.Queue = asyncio.Queue()
         self._poll_task: Optional[asyncio.Task] = None
+        self._rediscover_retry_task: Optional[asyncio.Task] = None
         self._current_index: int = 0
         self._running: bool = False
         self._missing_values_retry: Dict[str, set[str]] = {}
@@ -221,6 +223,7 @@ class WemCoordinator:
             await self._discover_all()
             self._running = True
             self._poll_task = asyncio.ensure_future(self._polling_loop())
+            self._start_selected_rediscover_retry()
             _LOGGER.info("Coordinator setup finished for host=%s", self.ip_address)
         except Exception:
             _LOGGER.exception("Coordinator setup failed for host=%s", self.ip_address)
@@ -236,6 +239,12 @@ class WemCoordinator:
             self._poll_task.cancel()
             try:
                 await self._poll_task
+            except asyncio.CancelledError:
+                pass
+        if self._rediscover_retry_task:
+            self._rediscover_retry_task.cancel()
+            try:
+                await self._rediscover_retry_task
             except asyncio.CancelledError:
                 pass
         if self._session and not self._session.closed:
@@ -467,7 +476,7 @@ class WemCoordinator:
             await asyncio.sleep(0.5)   # brief pause between requests
         _LOGGER.info("Discovery complete – %d parameter(s) found", len(self._parameters))
 
-    async def _discover_stack(self, stack: str) -> None:
+    async def _discover_stack(self, stack: str) -> bool:
         params = await self._fetch_stack(stack)
 
         if params is None:
@@ -483,7 +492,7 @@ class WemCoordinator:
                 param_type="readonly",
                 discovery_failed=True,
             )
-            return
+            return False
 
         if len(params) == 0:
             _LOGGER.warning(
@@ -492,6 +501,7 @@ class WemCoordinator:
             )
 
         await self._store_discovered_params(stack, params)
+        return True
 
     async def _bootstrap_entries_from_home(self) -> int:
         """Bootstrap initial stack entries from home page when none are configured."""
@@ -550,6 +560,63 @@ class WemCoordinator:
         """Public API: re-run discovery for one stack (e.g. service call)."""
         _LOGGER.info("Re-discovering stack: %s", stack[:40])
         await self._discover_stack(stack)
+
+    def _start_selected_rediscover_retry(self) -> None:
+        """Start background rediscovery loop for the selected stack from options."""
+        if self.hass is None or self.config_entry is None:
+            return
+
+        selected_stack = str(self.config_entry.options.get(CONF_REDISCOVER_STACK, "") or "").strip()
+        if not selected_stack:
+            return
+
+        if self._rediscover_retry_task and not self._rediscover_retry_task.done():
+            self._rediscover_retry_task.cancel()
+
+        self._rediscover_retry_task = asyncio.ensure_future(
+            self._rediscover_selected_stack_loop(selected_stack)
+        )
+
+    async def _rediscover_selected_stack_loop(self, selected_stack: str) -> None:
+        """Retry rediscovery for a selected stack every 20s until success or option changes."""
+        try:
+            while True:
+                if self.config_entry is None or self.hass is None:
+                    return
+
+                current_selected = str(
+                    self.config_entry.options.get(CONF_REDISCOVER_STACK, "") or ""
+                ).strip()
+                if current_selected != selected_stack:
+                    _LOGGER.info(
+                        "Stopping rediscover retry for stack %s because selection changed",
+                        selected_stack[:40],
+                    )
+                    return
+
+                success = await self._discover_stack(selected_stack)
+                if success:
+                    _LOGGER.info(
+                        "Rediscover retry for stack %s succeeded; clearing selection",
+                        selected_stack[:40],
+                    )
+                    self.hass.config_entries.async_update_entry(
+                        self.config_entry,
+                        options={
+                            **self.config_entry.options,
+                            CONF_REDISCOVER_STACK: "",
+                        },
+                    )
+                    return
+
+                await asyncio.sleep(20)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception(
+                "Rediscover retry loop failed for stack %s",
+                selected_stack[:40],
+            )
 
     async def async_initialize_entries(
         self,
