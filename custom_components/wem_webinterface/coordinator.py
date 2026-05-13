@@ -886,6 +886,14 @@ class WemCoordinator:
                     write_fields=p.write_fields,
                 )
                 self._parameters[key] = info
+            else:
+                # Update metadata for existing parameter (enables correction of scaled values)
+                info.unit = p.unit
+                info.min_value = p.min_value
+                info.max_value = p.max_value
+                info.step = p.step
+                info.options = p.options
+                info.form_field_name = p.form_field_name
 
             info.write_action = p.write_action
             info.write_fields = p.write_fields
