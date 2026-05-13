@@ -173,22 +173,43 @@ def _parse_wem_writable_form(form: Tag, active_labels: List[str], stack: str) ->
     if numeric_mode:
         numeric_option_values = [value for value in numeric_values if value is not None]
         numeric_option_values = sorted(set(numeric_option_values))
-        step = _detect_step(numeric_option_values)
         unit = _infer_unit(form, name_parts)
         if not unit and any("temperatur" in part.lower() for part in name_parts):
             unit = "°C"
+
+        scale_factor = _detect_scale_factor(numeric_option_values, unit)
+        step = _detect_step(numeric_option_values)
+        scaled_current = current_value
+        scaled_min = min(numeric_option_values) if numeric_option_values else None
+        scaled_max = max(numeric_option_values) if numeric_option_values else None
+        scaled_step = step
+
+        if scale_factor > 1.0:
+            if isinstance(scaled_current, (int, float)):
+                scaled_current = float(scaled_current) / scale_factor
+            if scaled_min is not None:
+                scaled_min = scaled_min / scale_factor
+            if scaled_max is not None:
+                scaled_max = scaled_max / scale_factor
+            if scaled_step is not None:
+                scaled_step = scaled_step / scale_factor
+
+        write_fields = dict(hidden_fields)
+        if scale_factor > 1.0:
+            write_fields["__scaling_factor__"] = str(int(scale_factor))
+
         return ParsedParameter(
             param_id=_slugify(" ,".join(name_parts)).replace(" ", ""),
             name=", ".join(name_parts) if name_parts else label or stack,
-            current_value=current_value,
+            current_value=scaled_current,
             param_type="number",
             unit=unit,
-            min_value=min(numeric_option_values) if numeric_option_values else None,
-            max_value=max(numeric_option_values) if numeric_option_values else None,
-            step=step,
+            min_value=scaled_min,
+            max_value=scaled_max,
+            step=scaled_step,
             form_field_name=select.get("name") or "value",
             write_action=form.get("action") or "pro_save.html",
-            write_fields=hidden_fields,
+            write_fields=write_fields,
         )
 
     return ParsedParameter(
@@ -252,25 +273,46 @@ def _leaf_label(form: Tag) -> str:
 
 
 def _detect_step(values: List[float]) -> Optional[float]:
-    """Detect step size from sorted option values.
-    
-    If all differences are multiples of 10, and individual values look like
-    they may be scaled by 10 (e.g., 205 instead of 20.5), return 0.1 instead of 1.
-    """
+    """Detect raw step size from sorted numeric option values."""
     if len(values) < 2:
         return None
     diffs = [round(values[i + 1] - values[i], 10) for i in range(len(values) - 1) if values[i + 1] > values[i]]
     if not diffs:
         return None
-    
-    base_step = min(diffs)
-    # Detect scaled values: if smallest diff is 10 and values are all divisible by 10,
-    # likely the device stores 20.5 as 205, so report step as 0.1 not 1
-    if base_step >= 10:
-        if all(v % 10 == 0 for v in values if v > 0):
-            return base_step / 10.0
-    
-    return base_step
+    return min(diffs)
+
+
+def _detect_scale_factor(values: List[float], unit: str) -> float:
+    """Detect encoded numeric scaling (e.g., 205 means 20.5).
+
+    WEM encodes some decimal values as integers*10. We detect this primarily
+    for temperature-like units when values are implausibly large.
+    """
+    if not values:
+        return 1.0
+
+    # Only integer-like option lists are candidates for encoded scaling.
+    int_values: List[int] = []
+    for value in values:
+        if abs(value - round(value)) > 1e-9:
+            return 1.0
+        int_values.append(int(round(value)))
+
+    if not int_values:
+        return 1.0
+
+    vmax = max(abs(v) for v in int_values)
+    if vmax < 100:
+        return 1.0
+
+    lower_unit = (unit or "").strip().lower()
+    is_temp_like = lower_unit in {"°c", "°f", "k"}
+    has_half_tenths_pattern = any(abs(v) % 10 == 5 for v in int_values)
+
+    if is_temp_like and (has_half_tenths_pattern or vmax >= 120):
+        return 10.0
+
+    return 1.0
 
 
 def _infer_unit(node: Tag, labels: List[str]) -> str:

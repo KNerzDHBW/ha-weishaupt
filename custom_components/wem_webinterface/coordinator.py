@@ -862,8 +862,31 @@ class WemCoordinator:
     # ------------------------------------------------------------------
 
     async def _poll_stack(self, stack: str) -> None:
+        has_known_params = any(
+            info.stack == stack and not info.discovery_failed
+            for info in self._parameters.values()
+        )
+
         params = await self._fetch_stack(stack)
+        if params is None and has_known_params:
+            # Keep existing entries and retry aggressively for transient read/parse failures.
+            for attempt in range(2, 11):
+                _LOGGER.warning(
+                    "Polling stack %s failed; retrying (%d/10)",
+                    stack[:40],
+                    attempt,
+                )
+                await asyncio.sleep(self.retry_interval)
+                params = await self._fetch_stack(stack)
+                if params is not None:
+                    break
+
         if params is None:
+            if has_known_params:
+                _LOGGER.error(
+                    "Polling stack %s failed after 10 attempts; keeping last known values",
+                    stack[:40],
+                )
             return
 
         for p in params:
