@@ -195,16 +195,6 @@ def _parse_wem_writable_form(form: Tag, active_labels: List[str], stack: str) ->
         scaled_max = max(numeric_option_values) if numeric_option_values else None
         scaled_step = step
 
-        if scale_factor > 1.0:
-            if isinstance(scaled_current, (int, float)):
-                scaled_current = float(scaled_current) / scale_factor
-            if scaled_min is not None:
-                scaled_min = scaled_min / scale_factor
-            if scaled_max is not None:
-                scaled_max = scaled_max / scale_factor
-            if scaled_step is not None:
-                scaled_step = scaled_step / scale_factor
-
         write_fields = dict(hidden_fields)
         if scale_factor > 1.0:
             write_fields["__scaling_factor__"] = str(int(scale_factor))

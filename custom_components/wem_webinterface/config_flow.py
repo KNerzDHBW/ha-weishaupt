@@ -187,6 +187,9 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         try:
             self._autoscan_result = self._autoscan_task.result()
             return await self.async_step_autoscan_summary()
+        except asyncio.CancelledError:
+            _LOGGER.info("Automatic initialization scan task was cancelled")
+            return await self.async_step_autoscan_failed()
         except Exception as exc:
             self._autoscan_error = exc
             _LOGGER.exception("Automatic initialization scan failed")
@@ -364,30 +367,34 @@ class WemOptionsFlow(config_entries.OptionsFlow):
     ) -> Dict[str, Any]:
         errors: Dict[str, str] = {}
 
-        if user_input is not None:
-            run_manual_scan = bool(user_input.get(CONF_INIT_SCAN_NOW, False))
-            entries_raw = user_input.get(CONF_ENTRIES, "")
+        try:
+            if user_input is not None:
+                run_manual_scan = bool(user_input.get(CONF_INIT_SCAN_NOW, False))
+                entries_raw = user_input.get(CONF_ENTRIES, "")
 
-            if not entries_raw.strip() and not run_manual_scan:
-                errors[CONF_ENTRIES] = "entries_empty"
-            else:
-                if run_manual_scan:
-                    self._pending_options_input = dict(user_input)
-                    self._manual_scan_result = None
-                    self._manual_scan_error = None
-                    try:
-                        self._manual_scan_task = self.hass.async_create_task(
-                            self._run_initialization_scan(self._pending_options_input)
-                        )
-                    except Exception as exc:
-                        _LOGGER.error("Initialization scan from options failed to start: %s", exc)
-                        errors["base"] = "init_scan_failed"
-                    else:
-                        return await self.async_step_manual_scan_progress()
+                if not entries_raw.strip() and not run_manual_scan:
+                    errors[CONF_ENTRIES] = "entries_empty"
                 else:
-                    # The one-click action should not remain enabled in saved options.
-                    user_input[CONF_INIT_SCAN_NOW] = False
-                    return self.async_create_entry(title="", data=user_input)
+                    if run_manual_scan:
+                        self._pending_options_input = dict(user_input)
+                        self._manual_scan_result = None
+                        self._manual_scan_error = None
+                        try:
+                            self._manual_scan_task = self.hass.async_create_task(
+                                self._run_initialization_scan(self._pending_options_input)
+                            )
+                        except Exception as exc:
+                            _LOGGER.error("Initialization scan from options failed to start: %s", exc)
+                            errors["base"] = "init_scan_failed"
+                        else:
+                            return await self.async_step_manual_scan_progress()
+                    else:
+                        # The one-click action should not remain enabled in saved options.
+                        user_input[CONF_INIT_SCAN_NOW] = False
+                        return self.async_create_entry(title="", data=user_input)
+        except Exception:
+            _LOGGER.exception("Unhandled error while opening options flow")
+            errors["base"] = "init_scan_failed"
 
         opts = self.config_entry.options
         data = self.config_entry.data
@@ -458,11 +465,14 @@ class WemOptionsFlow(config_entries.OptionsFlow):
 
         try:
             self._manual_scan_result = self._manual_scan_task.result()
-            return self.async_show_progress_done(next_step_id="manual_scan_summary")
+            return await self.async_step_manual_scan_summary()
+        except asyncio.CancelledError:
+            _LOGGER.info("Manual initialization scan task was cancelled")
+            return await self.async_step_manual_scan_failed()
         except Exception as exc:
             self._manual_scan_error = exc
             _LOGGER.exception("Initialization scan from options failed")
-            return self.async_show_progress_done(next_step_id="manual_scan_failed")
+            return await self.async_step_manual_scan_failed()
 
     async def async_step_manual_scan_summary(
         self, user_input: Optional[Dict[str, Any]] = None
