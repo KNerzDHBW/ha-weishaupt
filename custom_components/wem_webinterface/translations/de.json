@@ -11,6 +11,11 @@
           "entries": "Stack-Einträge (optional, eine Zeile pro Eintrag)"
         }
       },
+      "autoscan": {
+        "title": "Automatischer Initialisierungs-Scan",
+        "description": "Hauptmenü-Scan {root_done}/{root_total}. Prüfe {root_current_index}/{root_total}: {root_current_label}. Verarbeitete Seiten: {processed}.\n\nDer Scan läuft im Hintergrund weiter. Drücke unten auf den Button, um die weitere Analyse zu überspringen und die Einrichtung sofort fortzusetzen.",
+        "submit": "Analyse überspringen und fortfahren"
+      },
       "autoscan_summary": {
         "title": "Automatischer Initialisierungs-Scan",
         "description": "Scan abgeschlossen. Übersicht der geparsten Hauptmenü-Stacks:\n{summary}"

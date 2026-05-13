@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, Optional
 
@@ -151,16 +152,24 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_autoscan(
         self, user_input: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """Show progress while automatic initialization scan runs."""
+        """Show running autoscan status and allow skipping it."""
         if self._autoscan_task is None:
             return await self.async_step_user()
 
         if not self._autoscan_task.done():
-            return self.async_show_progress(
+            if user_input is not None:
+                await self._cancel_autoscan_task()
+                if self._pending_user_input is None:
+                    return await self.async_step_user()
+                return self.async_create_entry(
+                    title=f"WEM {self._pending_user_input[CONF_IP_ADDRESS]}",
+                    data=self._pending_user_input,
+                )
+
+            return self.async_show_form(
                 step_id="autoscan",
-                progress_action="initial_autoscan",
+                data_schema=vol.Schema({}),
                 description_placeholders=self._autoscan_description_placeholders(),
-                progress_task=self._autoscan_task,
             )
 
         try:
@@ -170,6 +179,19 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._autoscan_error = exc
             _LOGGER.exception("Automatic initialization scan failed")
             return self.async_show_progress_done(next_step_id="autoscan_failed")
+
+    async def _cancel_autoscan_task(self) -> None:
+        """Cancel running autoscan task when user chooses to skip."""
+        if self._autoscan_task is None or self._autoscan_task.done():
+            return
+
+        self._autoscan_task.cancel()
+        try:
+            await self._autoscan_task
+        except asyncio.CancelledError:
+            _LOGGER.info("Autoscan task cancelled by user during setup")
+        finally:
+            self._autoscan_task = None
 
     async def async_step_autoscan_failed(
         self, user_input: Optional[Dict[str, Any]] = None
@@ -254,6 +276,18 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Run one automatic full scan during initial setup."""
         from .coordinator import WemCoordinator
 
+        async def _set_phase(label: str) -> None:
+            await self._on_autoscan_progress(
+                {
+                    "root_total": 1,
+                    "root_done": 0,
+                    "root_current_index": 1,
+                    "root_current_stack": "",
+                    "root_current_menu": label,
+                    "processed": 0,
+                }
+            )
+
         temp_coordinator = WemCoordinator(
             ip_address=user_input[CONF_IP_ADDRESS],
             username=user_input[CONF_USERNAME],
@@ -268,10 +302,15 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         try:
             _LOGGER.info("Autoscan setup started for host=%s", user_input.get(CONF_IP_ADDRESS))
+            await _set_phase("Connecting")
             await temp_coordinator._create_session()
+            await _set_phase("Checking network")
             await temp_coordinator._check_ip_reachability()
+            await _set_phase("Checking web interface")
             await temp_coordinator._check_web_port_reachability()
+            await _set_phase("Logging in")
             await temp_coordinator._login()
+            await _set_phase("Starting menu scan")
             scan_result = await temp_coordinator.async_initialize_entries(
                 scan_interval_seconds=5,
                 max_entries=500,

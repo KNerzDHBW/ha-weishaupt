@@ -4,9 +4,12 @@ Standalone runner for the WEM Web Interface – no Home Assistant required.
 
 Usage:
     python run.py [--debug] [--dump-html]
+        python run.py --list-entries
 
   --debug      Enable DEBUG-level logging
   --dump-html  Save raw HTML of each fetched page to ./html_dumps/
+    --list-entries  Recursively scan all menus and print only the discovered entries
+                                    one per line, then exit.
 
 Interactive commands (after discovery):
     list          – show all discovered parameters
@@ -109,8 +112,9 @@ async def main(args: argparse.Namespace) -> None:
     if dump_dir:
         _patch_for_html_dump(coordinator, dump_dir)
 
-    # Register a simple callback to print value changes
-    coordinator.register_new_param_callback(_on_new_param)
+    if not args.list_entries:
+        # Register a simple callback to print value changes
+        coordinator.register_new_param_callback(_on_new_param)
 
     logger.info("Connecting to http://%s …", DEFAULT_IP)
 
@@ -118,6 +122,24 @@ async def main(args: argparse.Namespace) -> None:
         await coordinator.async_setup()
     except Exception as exc:
         logger.error("Setup failed: %s (%r)", exc.__class__.__name__, exc)
+        await coordinator.async_teardown()
+        return
+
+    if args.list_entries:
+        logger.info("Running recursive menu scan and printing entries only …")
+        try:
+            await coordinator.async_initialize_entries(
+                scan_interval_seconds=args.cycle,
+                max_entries=500,
+            )
+        except Exception as exc:
+            logger.error("Entry scan failed: %s (%r)", exc.__class__.__name__, exc)
+            await coordinator.async_teardown()
+            return
+
+        _print_entries(coordinator)
+        logger.info("Printed %d entry(ies).", len(coordinator.entries))
+        logger.info("Shutting down…")
         await coordinator.async_teardown()
         return
 
@@ -288,6 +310,15 @@ def _print_all(coordinator: WemCoordinator) -> None:
         print(f"{i:<5} {p.param_type:<9} {p.name[:54]:<55} {str(p.current_value):<15} {p.unit}")
 
 
+def _print_entries(coordinator: WemCoordinator) -> None:
+    seen: set[str] = set()
+    for entry in coordinator.entries:
+        if entry in seen:
+            continue
+        seen.add(entry)
+        print(entry)
+
+
 def _print_stack(coordinator: WemCoordinator, stack: str) -> None:
     params = [p for p in coordinator.get_all_parameters() if p.stack == stack]
     for p in params:
@@ -420,6 +451,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WEM Web Interface standalone runner")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--dump-html", action="store_true", help="Save HTML dumps to ./html_dumps/")
+    parser.add_argument(
+        "--list-entries",
+        action="store_true",
+        help="Recursively scan all menus and print only the discovered entries, one per line",
+    )
     parser.add_argument("--interactive", "-i", action="store_true", help="Start interactive REPL")
     parser.add_argument("--cycle", type=int, default=20, help="Cycle interval in seconds (default 20)")
     parser.add_argument("--retry", type=int, default=5, help="Retry interval in seconds (default 5)")

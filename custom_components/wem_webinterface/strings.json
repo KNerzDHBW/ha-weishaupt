@@ -11,6 +11,11 @@
           "entries": "Stack entries (optional, one entry per line)"
         }
       },
+      "autoscan": {
+        "title": "Automatic initialization scan",
+        "description": "Main menu scan {root_done}/{root_total}. Checking {root_current_index}/{root_total}: {root_current_label}. Processed pages: {processed}.\n\nThe scan keeps running in the background. Press the button below to skip further analysis and continue setup immediately.",
+        "submit": "Skip and continue"
+      },
       "autoscan_summary": {
         "title": "Automatic initialization scan",
         "description": "Scan complete. Parsed main menu stack overview:\n{summary}"

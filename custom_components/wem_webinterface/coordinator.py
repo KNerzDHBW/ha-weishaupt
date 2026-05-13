@@ -279,16 +279,24 @@ class WemCoordinator:
             command = ["ping", "-c", "1", "-W", str(timeout_seconds), target]
 
         try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    subprocess.run,
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout_seconds + 1,
+                ),
+                timeout=timeout_seconds + 3,
             )
         except FileNotFoundError as exc:
             raise ConnectionError(
                 "Ping command not available on this system. Cannot check host reachability first."
+            ) from exc
+        except (subprocess.TimeoutExpired, asyncio.TimeoutError) as exc:
+            raise ConnectionError(
+                f"WEM device {target} did not answer ping within {timeout_seconds}s."
             ) from exc
 
         if result.returncode != 0:
