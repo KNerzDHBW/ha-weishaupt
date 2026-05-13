@@ -109,6 +109,7 @@ class WemCoordinator:
         self._poll_task: Optional[asyncio.Task] = None
         self._current_index: int = 0
         self._running: bool = False
+        self._missing_values_retry: Dict[str, set[str]] = {}
 
     # ------------------------------------------------------------------
     # Factory from HA ConfigEntry
@@ -835,6 +836,10 @@ class WemCoordinator:
                     await self._poll_stack(stack)
                     self._current_index = (self._current_index + 1) % len(self.entries)
 
+                    # After one full pass over all entries, retry missing values once.
+                    if self._current_index == 0 and self._missing_values_retry:
+                        await self._retry_missing_values_once()
+
                 # A write may have arrived while we were polling – handle it
                 # immediately instead of sleeping first.
                 if not self._write_queue.empty():
@@ -861,11 +866,53 @@ class WemCoordinator:
     # Polling a single stack
     # ------------------------------------------------------------------
 
-    async def _poll_stack(self, stack: str) -> None:
-        has_known_params = any(
-            info.stack == stack and not info.discovery_failed
+    def _known_param_ids_for_stack(self, stack: str) -> set[str]:
+        """Return all known parameter IDs for a stack (excluding failure markers)."""
+        return {
+            info.param_id
             for info in self._parameters.values()
+            if info.stack == stack and not info.discovery_failed
+        }
+
+    async def _retry_missing_values_once(self) -> None:
+        """Retry parameters that were missing in the last full polling pass."""
+        retry_map = {stack: set(ids) for stack, ids in self._missing_values_retry.items() if ids}
+        if not retry_map:
+            return
+
+        total_missing = sum(len(ids) for ids in retry_map.values())
+        _LOGGER.warning(
+            "Retry pass for missing values started: stacks=%d params=%d",
+            len(retry_map),
+            total_missing,
         )
+
+        unresolved: Dict[str, set[str]] = {}
+        for stack, missing_ids in retry_map.items():
+            seen_ids = await self._poll_stack(stack, track_missing=False)
+            if seen_ids is None:
+                unresolved[stack] = missing_ids
+            else:
+                still_missing = missing_ids - seen_ids
+                if still_missing:
+                    unresolved[stack] = still_missing
+
+            if self.retry_interval > 0:
+                await asyncio.sleep(self.retry_interval)
+
+        self._missing_values_retry = unresolved
+        if unresolved:
+            _LOGGER.warning(
+                "Retry pass finished with unresolved values: stacks=%d params=%d",
+                len(unresolved),
+                sum(len(ids) for ids in unresolved.values()),
+            )
+        else:
+            _LOGGER.info("Retry pass finished: all previously missing values were refreshed")
+
+    async def _poll_stack(self, stack: str, track_missing: bool = True) -> Optional[set[str]]:
+        known_param_ids = self._known_param_ids_for_stack(stack)
+        has_known_params = bool(known_param_ids)
 
         params = await self._fetch_stack(stack)
         if params is None and has_known_params:
@@ -887,9 +934,12 @@ class WemCoordinator:
                     "Polling stack %s failed after 10 attempts; keeping last known values",
                     stack[:40],
                 )
-            return
+            return None
+
+        seen_param_ids: set[str] = set()
 
         for p in params:
+            seen_param_ids.add(p.param_id)
             key = self.make_key(stack, p.param_id)
             info = self._parameters.get(key)
             if info is None:
@@ -930,6 +980,20 @@ class WemCoordinator:
                     "Value changed: %s  %s → %s", p.name, old_val, p.current_value
                 )
                 await self._fire_callbacks(key)
+
+        if track_missing and known_param_ids:
+            missing = known_param_ids - seen_param_ids
+            if missing:
+                self._missing_values_retry[stack] = missing
+                _LOGGER.warning(
+                    "Polling stack %s missing %d known value(s); scheduling retry pass",
+                    stack[:40],
+                    len(missing),
+                )
+            else:
+                self._missing_values_retry.pop(stack, None)
+
+        return seen_param_ids
 
     # ------------------------------------------------------------------
     # Value callbacks
@@ -991,12 +1055,20 @@ class WemCoordinator:
         field_name = info.form_field_name or "value"
         
         # Check if this parameter uses 10x scaling (e.g., 20.5°C stored as 205)
-        write_value = value
+        write_value: Any = value
         if info.write_fields and info.write_fields.get("__scaling_factor__") == "10":
             # Apply scaling: multiply by 10 when writing
             try:
-                write_value = float(value) * 10
+                write_value = int(round(float(value) * 10))
                 _LOGGER.debug("Applying 10x scaling for write: %s → %s", value, write_value)
+            except (ValueError, TypeError):
+                pass
+        else:
+            # Avoid sending trailing .0 for integer-like numbers (device expects exact option values)
+            try:
+                numeric_value = float(value)
+                if numeric_value.is_integer():
+                    write_value = int(numeric_value)
             except (ValueError, TypeError):
                 pass
 

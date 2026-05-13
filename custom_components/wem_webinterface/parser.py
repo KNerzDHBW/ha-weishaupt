@@ -146,9 +146,17 @@ def _parse_wem_writable_form(form: Tag, active_labels: List[str], stack: str) ->
     if select is None:
         return None
 
-    option_texts = [_normalize_text(opt.get_text(" ", strip=True)) for opt in select.find_all("option")]
+    options = select.find_all("option")
+    option_texts = [_normalize_text(opt.get_text(" ", strip=True)) for opt in options]
     numeric_values = [_to_float(text) for text in option_texts]
     numeric_mode = bool(option_texts) and all(value is not None for value in numeric_values)
+
+    # Raw POST values can differ from visible labels (e.g. visible 20.5, raw value 205).
+    raw_option_numeric_values: List[Optional[float]] = []
+    for opt, text in zip(options, option_texts):
+        raw_attr = opt.get("value")
+        raw_value = _to_float(raw_attr) if raw_attr not in (None, "") else _to_float(text)
+        raw_option_numeric_values.append(raw_value)
 
     selected_option = select.find("option", selected=True)
     if selected_option is None:
@@ -177,7 +185,10 @@ def _parse_wem_writable_form(form: Tag, active_labels: List[str], stack: str) ->
         if not unit and any("temperatur" in part.lower() for part in name_parts):
             unit = "°C"
 
-        scale_factor = _detect_scale_factor(numeric_option_values, unit)
+        scale_factor = _detect_select_scale_factor(numeric_values, raw_option_numeric_values)
+        if scale_factor <= 1.0:
+            raw_numeric = [value for value in raw_option_numeric_values if value is not None]
+            scale_factor = _detect_scale_factor(raw_numeric, unit)
         step = _detect_step(numeric_option_values)
         scaled_current = current_value
         scaled_min = min(numeric_option_values) if numeric_option_values else None
@@ -312,6 +323,31 @@ def _detect_scale_factor(values: List[float], unit: str) -> float:
     if is_temp_like and (has_half_tenths_pattern or vmax >= 120):
         return 10.0
 
+    return 1.0
+
+
+def _detect_select_scale_factor(
+    visible_values: List[Optional[float]], raw_values: List[Optional[float]]
+) -> float:
+    """Infer scaling from select option text/value pairs (visible vs raw POST value)."""
+    ratios: List[float] = []
+    for visible, raw in zip(visible_values, raw_values):
+        if visible is None or raw is None:
+            continue
+        if abs(visible) < 1e-9:
+            continue
+        ratios.append(raw / visible)
+
+    if not ratios:
+        return 1.0
+
+    first = ratios[0]
+    if any(abs(r - first) > 1e-6 for r in ratios[1:]):
+        return 1.0
+
+    for candidate in (10.0, 100.0, 1000.0):
+        if abs(first - candidate) < 1e-3:
+            return candidate
     return 1.0
 
 
