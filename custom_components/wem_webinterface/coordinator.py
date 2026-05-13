@@ -564,6 +564,7 @@ class WemCoordinator:
         known: set[str] = set(self.entries)
         new_entries: List[str] = []
         attempts: Dict[str, int] = {stack: 0 for stack in queue}
+        details: List[Dict[str, Any]] = []
         processed = 0
         failed = 0
         last_fetch_ts: Optional[float] = None
@@ -620,23 +621,69 @@ class WemCoordinator:
                             attempts[stack],
                         )
                         queue.append(stack)
+                        details.append(
+                            {
+                                "stack": stack,
+                                "menu": "(retry)",
+                                "status": "retry",
+                                "parsed_params": 0,
+                                "found_nested": 0,
+                            }
+                        )
                     else:
                         failed += 1
+                        details.append(
+                            {
+                                "stack": stack,
+                                "menu": "(failed)",
+                                "status": "failed",
+                                "parsed_params": 0,
+                                "found_nested": 0,
+                            }
+                        )
                     continue
 
                 nested = _extract_stack_links_from_html(html)
+                nested_added = 0
                 for nested_stack in nested:
                     if nested_stack not in known:
                         known.add(nested_stack)
                         self.entries.append(nested_stack)
                         new_entries.append(nested_stack)
                         queue.append(nested_stack)
+                        attempts[nested_stack] = 0
+                        nested_added += 1
 
                 params = parse_settings_page(html, stack)
                 if params is None:
                     failed += 1
+                    details.append(
+                        {
+                            "stack": stack,
+                            "menu": "(unparsed)",
+                            "status": "failed",
+                            "parsed_params": 0,
+                            "found_nested": nested_added,
+                        }
+                    )
                     continue
                 await self._store_discovered_params(stack, params)
+
+                menu_name = "(unknown)"
+                if params:
+                    first_name = str(params[0].name or "").strip()
+                    if first_name:
+                        menu_name = first_name.split(",")[0].strip()
+
+                details.append(
+                    {
+                        "stack": stack,
+                        "menu": menu_name,
+                        "status": "ok",
+                        "parsed_params": len(params),
+                        "found_nested": nested_added,
+                    }
+                )
 
             _LOGGER.info(
                 "Initialization scan done: processed=%d, new_entries=%d, failed=%d, total_entries=%d",
@@ -650,6 +697,7 @@ class WemCoordinator:
                 "new_entries": len(new_entries),
                 "failed": failed,
                 "total_entries": len(self.entries),
+                "details": details,
             }
         finally:
             if was_running:

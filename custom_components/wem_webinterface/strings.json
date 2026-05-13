@@ -10,7 +10,18 @@
           "password": "Password",
           "entries": "Stack entries (optional, one entry per line)"
         }
+      },
+      "autoscan_summary": {
+        "title": "Automatic initialization scan",
+        "description": "Scan complete. Parsed main menu stack overview:\n{summary}"
+      },
+      "autoscan_failed": {
+        "title": "Automatic initialization scan",
+        "description": "The automatic full scan failed. Continue anyway and run scan later from options or service."
       }
+    },
+    "progress": {
+      "initial_autoscan": "Scanning WEM menus recursively (minimum 5s between page loads)."
     },
     "error": {
       "entries_empty": "At least one stack entry must be provided."
@@ -32,7 +43,18 @@
           "init_scan_interval": "Scan interval between page loads (seconds, minimum 5)",
           "init_scan_max_entries": "Maximum entries to scan"
         }
+      },
+      "manual_scan_failed": {
+        "title": "Initialization scan",
+        "description": "Manual full scan failed. Continue anyway and keep current entries."
+      },
+      "manual_scan_summary": {
+        "title": "Initialization scan",
+        "description": "Manual scan complete. Parsed menu overview:\n{summary}"
       }
+    },
+    "progress": {
+      "manual_init_scan": "Running manual full scan (minimum 5s between page loads)."
     },
     "error": {
       "entries_empty": "At least one stack entry must be provided.",

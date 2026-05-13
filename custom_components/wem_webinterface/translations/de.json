@@ -8,9 +8,20 @@
           "ip_address": "IP-Adresse oder DNS-Name",
           "username": "Benutzername",
           "password": "Passwort",
-          "entries": "Stack-Einträge (eine Zeile pro Eintrag)"
+          "entries": "Stack-Einträge (optional, eine Zeile pro Eintrag)"
         }
+      },
+      "autoscan_summary": {
+        "title": "Automatischer Initialisierungs-Scan",
+        "description": "Scan abgeschlossen. Übersicht der geparsten Hauptmenü-Stacks:\n{summary}"
+      },
+      "autoscan_failed": {
+        "title": "Automatischer Initialisierungs-Scan",
+        "description": "Der automatische Vollscan ist fehlgeschlagen. Du kannst trotzdem fortfahren und den Scan später über Optionen oder Service starten."
       }
+    },
+    "progress": {
+      "initial_autoscan": "WEM-Menüs werden rekursiv gescannt (mindestens 5 Sekunden zwischen Seitenabrufen)."
     },
     "error": {
       "entries_empty": "Es muss mindestens ein Stack-Eintrag angegeben werden."
@@ -32,7 +43,18 @@
           "init_scan_interval": "Scan-Intervall zwischen Seitenabrufen (Sekunden, mindestens 5)",
           "init_scan_max_entries": "Maximal zu scannende Einträge"
         }
+      },
+      "manual_scan_failed": {
+        "title": "Initialisierungs-Scan",
+        "description": "Manueller Vollscan fehlgeschlagen. Du kannst trotzdem fortfahren und die aktuellen Einträge beibehalten."
+      },
+      "manual_scan_summary": {
+        "title": "Initialisierungs-Scan",
+        "description": "Manueller Scan abgeschlossen. Übersicht der geparsten Menüs:\n{summary}"
       }
+    },
+    "progress": {
+      "manual_init_scan": "Manueller Vollscan läuft (mindestens 5 Sekunden zwischen Seitenabrufen)."
     },
     "error": {
       "entries_empty": "Es muss mindestens ein Stack-Eintrag angegeben werden.",
