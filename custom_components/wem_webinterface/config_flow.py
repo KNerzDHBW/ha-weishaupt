@@ -9,6 +9,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import selector
 
 from .const import (
     CONF_CYCLE_INTERVAL,
@@ -28,9 +29,16 @@ from .const import (
     DEFAULT_RETRY_INTERVAL,
     DOMAIN,
 )
-from .coordinator import WemCoordinator, _parse_entries
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _parse_entries(raw: str) -> list[str]:
+    """Parse stack entries from newline- or semicolon-separated text."""
+    for sep in ("\n", ";"):
+        if sep in raw:
+            return [line.strip() for line in raw.split(sep) if line.strip()]
+    return [raw.strip()] if raw.strip() else []
 
 
 def _safe_int(value: Any, default: int) -> int:
@@ -121,7 +129,9 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_USERNAME, default="admin"): str,
                 vol.Required(CONF_PASSWORD): str,
                 # One stack entry per line (each line may contain comma-separated IDs)
-                vol.Optional(CONF_ENTRIES, default=""): str,
+                vol.Optional(CONF_ENTRIES, default=""): selector.TextSelector(
+                    selector.TextSelectorConfig(multiline=True)
+                ),
             }
         )
 
@@ -158,7 +168,7 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_show_progress_done(next_step_id="autoscan_summary")
         except Exception as exc:
             self._autoscan_error = exc
-            _LOGGER.error("Automatic initialization scan failed: %s", exc)
+            _LOGGER.exception("Automatic initialization scan failed")
             return self.async_show_progress_done(next_step_id="autoscan_failed")
 
     async def async_step_autoscan_failed(
@@ -242,6 +252,8 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def _run_initial_autoscan(self, user_input: Dict[str, Any]) -> Dict[str, Any]:
         """Run one automatic full scan during initial setup."""
+        from .coordinator import WemCoordinator
+
         temp_coordinator = WemCoordinator(
             ip_address=user_input[CONF_IP_ADDRESS],
             username=user_input[CONF_USERNAME],
@@ -255,6 +267,7 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
         try:
+            _LOGGER.info("Autoscan setup started for host=%s", user_input.get(CONF_IP_ADDRESS))
             await temp_coordinator._create_session()
             await temp_coordinator._check_ip_reachability()
             await temp_coordinator._check_web_port_reachability()
@@ -265,7 +278,17 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 progress_callback=self._on_autoscan_progress,
             )
             user_input[CONF_ENTRIES] = "\n".join(temp_coordinator.entries)
+            _LOGGER.info(
+                "Autoscan completed: processed=%s new_entries=%s failed=%s total_entries=%s",
+                scan_result.get("processed"),
+                scan_result.get("new_entries"),
+                scan_result.get("failed"),
+                scan_result.get("total_entries"),
+            )
             return scan_result
+        except Exception:
+            _LOGGER.exception("Autoscan failed during setup for host=%s", user_input.get(CONF_IP_ADDRESS))
+            raise
         finally:
             await temp_coordinator.async_teardown()
 
@@ -344,7 +367,7 @@ class WemOptionsFlow(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_ENTRIES,
                     default=entries_default,
-                ): str,
+                ): selector.TextSelector(selector.TextSelectorConfig(multiline=True)),
                 vol.Optional(
                     CONF_INIT_SCAN_NOW,
                     default=False,
@@ -387,7 +410,7 @@ class WemOptionsFlow(config_entries.OptionsFlow):
             return self.async_show_progress_done(next_step_id="manual_scan_summary")
         except Exception as exc:
             self._manual_scan_error = exc
-            _LOGGER.error("Initialization scan from options failed: %s", exc)
+            _LOGGER.exception("Initialization scan from options failed")
             return self.async_show_progress_done(next_step_id="manual_scan_failed")
 
     async def async_step_manual_scan_summary(
@@ -428,6 +451,8 @@ class WemOptionsFlow(config_entries.OptionsFlow):
 
     async def _run_initialization_scan(self, user_input: Dict[str, Any]) -> Dict[str, Any]:
         """Run full recursive scan once and return entries plus scan details."""
+        from .coordinator import WemCoordinator
+
         data = self.config_entry.data
         opts = self.config_entry.options
 
@@ -459,6 +484,12 @@ class WemOptionsFlow(config_entries.OptionsFlow):
         )
 
         try:
+            _LOGGER.info(
+                "Manual initialization scan started for host=%s (interval=%s, max_entries=%s)",
+                data.get(CONF_IP_ADDRESS),
+                interval,
+                max_entries,
+            )
             await temp_coordinator._create_session()
             await temp_coordinator._check_ip_reachability()
             await temp_coordinator._check_web_port_reachability()
@@ -467,9 +498,19 @@ class WemOptionsFlow(config_entries.OptionsFlow):
                 scan_interval_seconds=interval,
                 max_entries=max_entries,
             )
+            _LOGGER.info(
+                "Manual initialization scan completed: processed=%s new_entries=%s failed=%s total_entries=%s",
+                scan_result.get("processed"),
+                scan_result.get("new_entries"),
+                scan_result.get("failed"),
+                scan_result.get("total_entries"),
+            )
             return {
                 "entries": temp_coordinator.entries,
                 "scan_result": scan_result,
             }
+        except Exception:
+            _LOGGER.exception("Manual initialization scan failed for host=%s", data.get(CONF_IP_ADDRESS))
+            raise
         finally:
             await temp_coordinator.async_teardown()

@@ -172,15 +172,38 @@ class WemCoordinator:
 
     async def async_setup(self) -> None:
         """Login, discover all stacks, then start background polling."""
+        _LOGGER.info(
+            "Coordinator setup started for host=%s (entries=%d, cycle=%ss, retry=%ss, max_retries=%d)",
+            self.ip_address,
+            len(self.entries),
+            self.cycle_interval,
+            self.retry_interval,
+            self.max_retries,
+        )
         await self._create_session()
         try:
             await self._check_ip_reachability()
+            _LOGGER.info("Reachability check (DNS/ping) passed for host=%s", self.ip_address)
             await self._check_web_port_reachability()
+            _LOGGER.info("Port 80 check passed for host=%s", self.ip_address)
             await self._login()
+            _LOGGER.info("Login completed for host=%s", self.ip_address)
+
+            if not self.entries:
+                added = await self._bootstrap_entries_from_home()
+                _LOGGER.info(
+                    "Initial bootstrap after login finished for host=%s: added=%d total_entries=%d",
+                    self.ip_address,
+                    added,
+                    len(self.entries),
+                )
+
             await self._discover_all()
             self._running = True
             self._poll_task = asyncio.ensure_future(self._polling_loop())
+            _LOGGER.info("Coordinator setup finished for host=%s", self.ip_address)
         except Exception:
+            _LOGGER.exception("Coordinator setup failed for host=%s", self.ip_address)
             if self._session and not self._session.closed:
                 await self._session.close()
             raise
@@ -351,9 +374,10 @@ class WemCoordinator:
                         continue
 
                     if resp.status != 200:
+                        body_preview = (await resp.text())[:240].replace("\n", " ").replace("\r", " ")
                         _LOGGER.warning(
-                            "Stack %s: HTTP %d (attempt %d/%d)",
-                            stack[:30], resp.status, attempt, self.max_retries,
+                            "Stack %s: HTTP %d (attempt %d/%d) url=%s preview=%s",
+                            stack[:30], resp.status, attempt, self.max_retries, url, body_preview,
                         )
                     else:
                         html = await resp.text()
@@ -370,9 +394,10 @@ class WemCoordinator:
                         if parsed is not None:
                             return html
 
-                        _LOGGER.debug(
-                            "Stack %s: page incomplete (attempt %d/%d), retrying in %ds",
-                            stack[:30], attempt, self.max_retries, self.retry_interval,
+                        html_preview = html[:240].replace("\n", " ").replace("\r", " ")
+                        _LOGGER.warning(
+                            "Stack %s: page could not be parsed (attempt %d/%d), retrying in %ds, preview=%s",
+                            stack[:30], attempt, self.max_retries, self.retry_interval, html_preview,
                         )
 
             except asyncio.TimeoutError:
@@ -418,7 +443,10 @@ class WemCoordinator:
         params = await self._fetch_stack(stack)
 
         if params is None:
-            _LOGGER.error("Discovery failed for stack %s", stack[:40])
+            _LOGGER.error(
+                "Discovery failed for stack %s (no parseable response after retries)",
+                stack[:40],
+            )
             key = self.make_key(stack, "discovery_failed")
             self._parameters[key] = ParameterInfo(
                 stack=stack,
@@ -429,7 +457,66 @@ class WemCoordinator:
             )
             return
 
+        if len(params) == 0:
+            _LOGGER.warning(
+                "Discovery returned 0 parameters for stack %s (page loaded but parser found nothing)",
+                stack[:40],
+            )
+
         await self._store_discovered_params(stack, params)
+
+    async def _bootstrap_entries_from_home(self) -> int:
+        """Bootstrap initial stack entries from home page when none are configured."""
+        added = 0
+        known: set[str] = set(self.entries)
+
+        try:
+            async with self._session.get(
+                f"{self.base_url}/home.html",
+                timeout=aiohttp.ClientTimeout(total=15),
+                allow_redirects=True,
+            ) as resp:
+                html = await resp.text()
+
+                if resp.status != 200:
+                    preview = html[:240].replace("\n", " ").replace("\r", " ")
+                    _LOGGER.warning(
+                        "Bootstrap home read failed: HTTP %d host=%s preview=%s",
+                        resp.status,
+                        self.ip_address,
+                        preview,
+                    )
+                    return 0
+
+                soup = BeautifulSoup(html, "lxml")
+                if is_login_page(soup):
+                    _LOGGER.warning(
+                        "Bootstrap home read returned login page for host=%s",
+                        self.ip_address,
+                    )
+                    return 0
+
+                for stack in _extract_stack_links_from_html(html):
+                    if stack not in known:
+                        known.add(stack)
+                        self.entries.append(stack)
+                        added += 1
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            _LOGGER.warning(
+                "Bootstrap from home page failed for host=%s: %s",
+                self.ip_address,
+                exc,
+            )
+            return 0
+
+        if added == 0:
+            _LOGGER.warning(
+                "Bootstrap found no stack links on home page for host=%s",
+                self.ip_address,
+            )
+
+        return added
 
     async def async_rediscover_stack(self, stack: str) -> None:
         """Public API: re-run discovery for one stack (e.g. service call)."""
