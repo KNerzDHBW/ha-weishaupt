@@ -1,0 +1,50 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "WEM Web Interface einrichten",
+        "description": "Verbindung zum WEM-Gerät konfigurieren.",
+        "data": {
+          "ip_address": "IP-Adresse",
+          "username": "Benutzername",
+          "password": "Passwort",
+          "entries": "Stack-Einträge (eine Zeile pro Eintrag)"
+        }
+      }
+    },
+    "error": {
+      "entries_empty": "Es muss mindestens ein Stack-Eintrag angegeben werden."
+    },
+    "abort": {
+      "already_configured": "Gerät ist bereits konfiguriert."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "WEM Optionen",
+        "data": {
+          "cycle_interval": "Zyklusintervall (Sekunden)",
+          "retry_interval": "Wiederholungsintervall bei unvollständiger Seite (Sekunden)",
+          "max_retries": "Maximale Wiederholungsversuche",
+          "entries": "Stack-Einträge (eine Zeile pro Eintrag)"
+        }
+      }
+    },
+    "error": {
+      "entries_empty": "Es muss mindestens ein Stack-Eintrag angegeben werden."
+    }
+  },
+  "services": {
+    "rediscover": {
+      "name": "Parameter neu entdecken",
+      "description": "Liest Metadaten (Wertebereich, Typ, …) für einen Stack-Eintrag neu aus.",
+      "fields": {
+        "stack": {
+          "name": "Stack",
+          "description": "Der Stack-String, der neu entdeckt werden soll (leer = alle)."
+        }
+      }
+    }
+  }
+}

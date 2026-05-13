@@ -1,0 +1,5 @@
+aiohttp>=3.9.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+voluptuous>=0.13.0
+homeassistant>=2024.6.0

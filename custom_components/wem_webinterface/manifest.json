@@ -1,0 +1,16 @@
+{
+  "domain": "wem_webinterface",
+  "name": "WEM Web Interface",
+  "version": "0.1.0",
+  "documentation": "https://github.com/your-repo/wem-webinterface",
+  "issue_tracker": "https://github.com/your-repo/wem-webinterface/issues",
+  "requirements": [
+    "aiohttp>=3.9.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0"
+  ],
+  "dependencies": [],
+  "codeowners": [],
+  "iot_class": "local_polling",
+  "config_flow": true
+}
