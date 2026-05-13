@@ -413,26 +413,31 @@ class WemCoordinator:
 
     async def _is_authenticated_session(self) -> bool:
         """Validate that the current cookie/session can access a protected page."""
-        probe_stack = self.entries[0] if self.entries else None
-        probe_url = (
-            f"{self.base_url}/settings_export.html?stack={probe_stack}"
-            if probe_stack
-            else f"{self.base_url}/home.html"
-        )
+        probe_urls: List[str] = [f"{self.base_url}/home.html"]
+        if self.entries:
+            probe_urls.append(f"{self.base_url}/settings_export.html?stack={self.entries[0]}")
 
-        async with self._session.get(
-            probe_url,
-            timeout=aiohttp.ClientTimeout(total=15),
-            allow_redirects=True,
-        ) as probe_resp:
-            probe_html = await probe_resp.text()
-            probe_soup = BeautifulSoup(probe_html, "lxml")
-            probe_path = urlparse(str(probe_resp.url)).path
-            return not (
-                probe_resp.status in (401, 403)
-                or probe_path.endswith("/login.html")
-                or is_login_page(probe_soup)
-            )
+        for probe_url in probe_urls:
+            try:
+                async with self._session.get(
+                    probe_url,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    allow_redirects=True,
+                ) as probe_resp:
+                    probe_html = await probe_resp.text()
+                    probe_soup = BeautifulSoup(probe_html, "lxml")
+                    probe_path = urlparse(str(probe_resp.url)).path
+                    unauthenticated = (
+                        probe_resp.status in (401, 403)
+                        or probe_path.endswith("/login.html")
+                        or is_login_page(probe_soup)
+                    )
+                    if not unauthenticated:
+                        return True
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                continue
+
+        return False
 
     # ------------------------------------------------------------------
     # Fetch a stack (with retries for incomplete pages)
