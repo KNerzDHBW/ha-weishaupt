@@ -15,7 +15,7 @@ Custom integration for Home Assistant to read and write values from the local WE
 
 Configure in the integration UI:
 
-- IP address
+- IP address or DNS name (e.g. `heizung.home`)
 - Username
 - Password
 - Stack entries (one stack per line)

@@ -12,6 +12,7 @@ Handles:
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import platform
 import socket
@@ -172,12 +173,17 @@ class WemCoordinator:
     async def async_setup(self) -> None:
         """Login, discover all stacks, then start background polling."""
         await self._create_session()
-        await self._check_ip_reachability()
-        await self._check_web_port_reachability()
-        await self._login()
-        await self._discover_all()
-        self._running = True
-        self._poll_task = asyncio.ensure_future(self._polling_loop())
+        try:
+            await self._check_ip_reachability()
+            await self._check_web_port_reachability()
+            await self._login()
+            await self._discover_all()
+            self._running = True
+            self._poll_task = asyncio.ensure_future(self._polling_loop())
+        except Exception:
+            if self._session and not self._session.closed:
+                await self._session.close()
+            raise
 
     async def async_teardown(self) -> None:
         """Stop polling and close HTTP session."""
@@ -204,12 +210,40 @@ class WemCoordinator:
         self._session = aiohttp.ClientSession(connector=connector, cookie_jar=jar)
 
     async def _check_ip_reachability(self, timeout_seconds: int = 5) -> None:
-        """Check whether the target IP is reachable by sending a single ping."""
+        """Check whether the configured host is reachable before port checks.
+
+        For literal IP addresses this performs a single ping.
+        For DNS hostnames this validates name resolution.
+        """
+        target = self.ip_address
+
+        try:
+            ipaddress.ip_address(target)
+            is_literal_ip = True
+        except ValueError:
+            is_literal_ip = False
+
+        if not is_literal_ip:
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(socket.getaddrinfo, target, None),
+                    timeout=timeout_seconds,
+                )
+                return
+            except asyncio.TimeoutError as exc:
+                raise ConnectionError(
+                    f"WEM host {target} DNS lookup timed out after {timeout_seconds}s."
+                ) from exc
+            except socket.gaierror as exc:
+                raise ConnectionError(
+                    f"WEM host {target} could not be resolved via DNS ({exc})."
+                ) from exc
+
         system = platform.system().lower()
         if system.startswith("win"):
-            command = ["ping", "-n", "1", "-w", str(timeout_seconds * 1000), self.ip_address]
+            command = ["ping", "-n", "1", "-w", str(timeout_seconds * 1000), target]
         else:
-            command = ["ping", "-c", "1", "-W", str(timeout_seconds), self.ip_address]
+            command = ["ping", "-c", "1", "-W", str(timeout_seconds), target]
 
         try:
             result = await asyncio.to_thread(
@@ -221,14 +255,14 @@ class WemCoordinator:
             )
         except FileNotFoundError as exc:
             raise ConnectionError(
-                "Ping command not available on this system. Cannot check IP reachability first."
+                "Ping command not available on this system. Cannot check host reachability first."
             ) from exc
 
         if result.returncode != 0:
             stderr = (result.stderr or result.stdout or "").strip()
             detail = f": {stderr}" if stderr else ""
             raise ConnectionError(
-                f"WEM device {self.ip_address} is not reachable on the network (ping failed){detail}"
+                f"WEM device {target} is not reachable on the network (ping failed){detail}"
             )
 
     async def _check_web_port_reachability(self, timeout_seconds: int = 5) -> None:
@@ -266,65 +300,139 @@ class WemCoordinator:
             ) as resp:
                 login_html = await resp.text()
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            _LOGGER.error("Cannot reach device at %s (login GET): %s", login_url, exc)
+            _LOGGER.error(
+                "Cannot reach device at %s (login GET): %s (%r)",
+                login_url,
+                exc.__class__.__name__,
+                exc,
+            )
             raise
 
         soup = BeautifulSoup(login_html, "lxml")
         form = soup.find("form")
 
-        form_data: Dict[str, str] = {}
-        action = login_url
+        if not form:
+            # Some devices serve the form only on /login.html.
+            explicit_login_url = f"{self.base_url}/login.html"
+            try:
+                async with self._session.get(
+                    explicit_login_url,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    allow_redirects=True,
+                ) as resp:
+                    login_html = await resp.text()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                _LOGGER.error(
+                    "Cannot reach explicit login page at %s: %s (%r)",
+                    explicit_login_url,
+                    exc.__class__.__name__,
+                    exc,
+                )
+                raise
+
+            soup = BeautifulSoup(login_html, "lxml")
+            form = soup.find("form")
+
+        hidden_fields: Dict[str, str] = {}
+        action = f"{self.base_url}/login.html"
         user_field = "user"
-        pass_field = "password"
+        pass_field = "pass"
 
         if form:
             # Collect hidden fields (CSRF tokens etc.)
             for inp in form.find_all("input", {"type": "hidden"}):
                 n = inp.get("name")
                 if n:
-                    form_data[n] = inp.get("value", "")
+                    hidden_fields[n] = inp.get("value", "")
 
             # Identify username / password field names
             for inp in form.find_all("input"):
                 itype = (inp.get("type") or "text").lower()
                 iname = (inp.get("name") or "").lower()
-                if itype in ("text", "email") or any(k in iname for k in ("user", "login", "name")):
+                if not iname:
+                    continue
+
+                if itype in ("text", "email") or any(
+                    k in iname for k in ("user", "username", "login", "name")
+                ):
                     user_field = inp.get("name", user_field)
-                elif itype == "password":
+                elif itype == "password" or any(k in iname for k in ("pass", "pwd")):
                     pass_field = inp.get("name", pass_field)
 
             raw_action = form.get("action", "/")
             if raw_action.startswith("http"):
                 action = raw_action
             else:
-                action = self.base_url + "/" + raw_action.lstrip("/")
-
-        form_data[user_field] = self.username
-        form_data[pass_field] = self.password
+                candidate = raw_action.strip()
+                if candidate in ("", "/"):
+                    action = f"{self.base_url}/login.html"
+                else:
+                    action = self.base_url + "/" + candidate.lstrip("/")
 
         try:
+            # Attempt 1: exact legacy WEM form expected by many devices.
+            primary_data: Dict[str, str] = dict(hidden_fields)
+            primary_data["user"] = self.username
+            primary_data["pass"] = self.password
+
             async with self._session.post(
-                action,
-                data=form_data,
+                f"{self.base_url}/login.html",
+                data=primary_data,
                 timeout=aiohttp.ClientTimeout(total=15),
                 allow_redirects=True,
             ) as resp:
-                login_response_html = await resp.text()
-                login_response_soup = BeautifulSoup(login_response_html, "lxml")
-                final_login_path = urlparse(str(resp.url)).path
+                await resp.text()
 
-                if final_login_path.endswith("/login.html") or is_login_page(login_response_soup):
-                    raise PermissionError(
-                        f"Invalid username/password for WEM device {self.ip_address}"
-                    )
+            if await self._is_authenticated_session():
+                _LOGGER.info("Login successful to %s (user/pass via /login.html)", self.base_url)
+                return
 
-                if final_login_path.endswith("/home.html"):
-                    _LOGGER.info("Login successful to %s", self.base_url)
-                else:
-                    _LOGGER.info("Login completed for %s (final URL: %s)", self.base_url, resp.url)
+            # Attempt 2: detected field/action names for firmware variants.
+            fallback_data: Dict[str, str] = dict(hidden_fields)
+            fallback_data[user_field] = self.username
+            fallback_data[pass_field] = self.password
+
+            async with self._session.post(
+                action,
+                data=fallback_data,
+                timeout=aiohttp.ClientTimeout(total=15),
+                allow_redirects=True,
+            ) as resp:
+                await resp.text()
+
+            if await self._is_authenticated_session():
+                _LOGGER.info("Login successful to %s (form-detected fields)", self.base_url)
+                return
+
+            raise PermissionError(
+                f"Invalid username/password for WEM device {self.ip_address}"
+            )
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            _LOGGER.error("Login POST failed: %s", exc)
+            _LOGGER.error("Login POST failed: %s (%r)", exc.__class__.__name__, exc)
             raise
+
+    async def _is_authenticated_session(self) -> bool:
+        """Validate that the current cookie/session can access a protected page."""
+        probe_stack = self.entries[0] if self.entries else None
+        probe_url = (
+            f"{self.base_url}/settings_export.html?stack={probe_stack}"
+            if probe_stack
+            else f"{self.base_url}/home.html"
+        )
+
+        async with self._session.get(
+            probe_url,
+            timeout=aiohttp.ClientTimeout(total=15),
+            allow_redirects=True,
+        ) as probe_resp:
+            probe_html = await probe_resp.text()
+            probe_soup = BeautifulSoup(probe_html, "lxml")
+            probe_path = urlparse(str(probe_resp.url)).path
+            return not (
+                probe_resp.status in (401, 403)
+                or probe_path.endswith("/login.html")
+                or is_login_page(probe_soup)
+            )
 
     # ------------------------------------------------------------------
     # Fetch a stack (with retries for incomplete pages)

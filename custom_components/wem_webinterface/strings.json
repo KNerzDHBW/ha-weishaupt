@@ -5,7 +5,7 @@
         "title": "Set up WEM Web Interface",
         "description": "Configure the connection to the WEM device.",
         "data": {
-          "ip_address": "IP address",
+          "ip_address": "IP address or DNS name",
           "username": "Username",
           "password": "Password",
           "entries": "Stack entries (one entry per line)"

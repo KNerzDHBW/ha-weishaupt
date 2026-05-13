@@ -56,6 +56,22 @@ class TestReachabilityChecks(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ping failed", message)
         self.assertIn("request timed out", message)
 
+    async def test_dns_hostname_uses_dns_resolution_without_ping(self):
+        coordinator = WemCoordinator(
+            ip_address="heizung.home",
+            username="admin",
+            password="secret",
+            entries=["seed"],
+            hass=None,
+            config_entry=None,
+        )
+
+        with patch("custom_components.wem_webinterface.coordinator.socket.getaddrinfo", return_value=[object()]):
+            with patch("custom_components.wem_webinterface.coordinator.subprocess.run") as ping_mock:
+                await coordinator._check_ip_reachability(timeout_seconds=1)
+
+        ping_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

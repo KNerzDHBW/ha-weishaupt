@@ -38,9 +38,9 @@ from custom_components.wem_webinterface.parser import parse_settings_page
 # Default configuration – change here or via environment variables
 # ---------------------------------------------------------------------------
 
-DEFAULT_IP       = os.environ.get("WEM_IP",       "ip_address_of_your_device")
+DEFAULT_IP       = os.environ.get("WEM_IP",       "heizung.home")
 DEFAULT_USER     = os.environ.get("WEM_USER",     "admin")
-DEFAULT_PASSWORD = os.environ.get("WEM_PASSWORD", "password")
+DEFAULT_PASSWORD = os.environ.get("WEM_PASSWORD", "C4v_mxfD43Lk")
 
 DEFAULT_ENTRIES = [
     # Entry 1: writable numeric (Heizkreis 2 Raumsolltemperatur Komfort)
@@ -117,7 +117,8 @@ async def main(args: argparse.Namespace) -> None:
     try:
         await coordinator.async_setup()
     except Exception as exc:
-        logger.error("Setup failed: %s", exc)
+        logger.error("Setup failed: %s (%r)", exc.__class__.__name__, exc)
+        await coordinator.async_teardown()
         return
 
     _print_all(coordinator)
