@@ -14,6 +14,7 @@ Interactive commands (after discovery):
     set <name_fragment> <value>  – write a value
     range <entry-id>  – show valid values for select/number parameter
     rediscover <stack_index|stack_string>  – re-run discovery for one entry
+    initscan [interval] [max_entries]  – one-time recursive stack initialization
     quit          – exit
 """
 
@@ -182,6 +183,7 @@ async def _interactive_loop(coordinator: WemCoordinator, logger) -> None:
                 "  set <name_fragment> <value>   – write a value\n"
                 "  range <entry-id>              – show valid values/options\n"
                 "  rediscover <idx|stack>        – re-discover one stack\n"
+                "  initscan [interval] [max]     – one-time recursive initialization scan\n"
                 "  quit                          – exit"
             )
 
@@ -232,6 +234,39 @@ async def _interactive_loop(coordinator: WemCoordinator, logger) -> None:
                 _print_stack(coordinator, stack)
             else:
                 print(f"Unknown stack: {parts[1]}")
+
+        elif cmd == "initscan":
+            interval = 10
+            max_entries = 500
+            if len(parts) >= 2:
+                try:
+                    interval = int(parts[1])
+                except ValueError:
+                    print("Usage: initscan [interval_seconds>=10] [max_entries]")
+                    continue
+            if len(parts) == 3:
+                try:
+                    max_entries = int(parts[2])
+                except ValueError:
+                    print("Usage: initscan [interval_seconds>=10] [max_entries]")
+                    continue
+
+            if interval < 10:
+                print("Interval must be at least 10 seconds.")
+                continue
+
+            print(
+                f"Starting initialization scan (interval={interval}s, max_entries={max_entries}) ..."
+            )
+            result = await coordinator.async_initialize_entries(
+                scan_interval_seconds=interval,
+                max_entries=max_entries,
+            )
+            print(
+                "Initialization scan finished: "
+                f"processed={result['processed']} new_entries={result['new_entries']} "
+                f"failed={result['failed']} total_entries={result['total_entries']}"
+            )
 
         else:
             print(f"Unknown command: {cmd}")

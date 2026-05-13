@@ -15,7 +15,9 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
+from time import monotonic
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -204,8 +206,8 @@ class WemCoordinator:
                 login_url, timeout=aiohttp.ClientTimeout(total=15), allow_redirects=True
             ) as resp:
                 login_html = await resp.text()
-        except aiohttp.ClientError as exc:
-            _LOGGER.error("Cannot reach device at %s: %s", login_url, exc)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            _LOGGER.error("Cannot reach device at %s (login GET): %s", login_url, exc)
             raise
 
         soup = BeautifulSoup(login_html, "lxml")
@@ -252,7 +254,7 @@ class WemCoordinator:
                     _LOGGER.info("Login successful to %s", self.base_url)
                 else:
                     _LOGGER.warning("Login returned HTTP %d", resp.status)
-        except aiohttp.ClientError as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             _LOGGER.error("Login POST failed: %s", exc)
             raise
 
@@ -260,7 +262,8 @@ class WemCoordinator:
     # Fetch a stack (with retries for incomplete pages)
     # ------------------------------------------------------------------
 
-    async def _fetch_stack(self, stack: str) -> Optional[List[ParsedParameter]]:
+    async def _fetch_stack_html(self, stack: str) -> Optional[str]:
+        """Fetch one stack page and return raw HTML (with retries/relogin)."""
         url = f"{self.base_url}/settings_export.html?stack={stack}"
 
         for attempt in range(1, self.max_retries + 1):
@@ -272,6 +275,7 @@ class WemCoordinator:
                         _LOGGER.info("Session expired, re-logging in")
                         await self._login()
                         continue
+
                     if resp.status != 200:
                         _LOGGER.warning(
                             "Stack %s: HTTP %d (attempt %d/%d)",
@@ -287,13 +291,11 @@ class WemCoordinator:
                             )
                             await self._login()
                             continue
-                        result = parse_settings_page(html, stack)
-                        if result is not None:
-                            _LOGGER.debug(
-                                "Stack %s: parsed %d parameter(s) (attempt %d)",
-                                stack[:30], len(result), attempt,
-                            )
-                            return result
+
+                        parsed = parse_settings_page(html, stack)
+                        if parsed is not None:
+                            return html
+
                         _LOGGER.debug(
                             "Stack %s: page incomplete (attempt %d/%d), retrying in %ds",
                             stack[:30], attempt, self.max_retries, self.retry_interval,
@@ -305,7 +307,6 @@ class WemCoordinator:
                 )
             except aiohttp.ClientError as exc:
                 _LOGGER.error("HTTP error on stack %s: %s", stack[:30], exc)
-                # Re-login and try again
                 try:
                     await self._login()
                 except Exception:
@@ -315,6 +316,17 @@ class WemCoordinator:
                 await asyncio.sleep(self.retry_interval)
 
         _LOGGER.error("Stack %s: gave up after %d attempts", stack[:30], self.max_retries)
+        return None
+
+    async def _fetch_stack(self, stack: str) -> Optional[List[ParsedParameter]]:
+        html = await self._fetch_stack_html(stack)
+        if html is None:
+            return None
+
+        result = parse_settings_page(html, stack)
+        if result is not None:
+            _LOGGER.debug("Stack %s: parsed %d parameter(s)", stack[:30], len(result))
+            return result
         return None
 
     # ------------------------------------------------------------------
@@ -343,6 +355,104 @@ class WemCoordinator:
             )
             return
 
+        await self._store_discovered_params(stack, params)
+
+    async def async_rediscover_stack(self, stack: str) -> None:
+        """Public API: re-run discovery for one stack (e.g. service call)."""
+        _LOGGER.info("Re-discovering stack: %s", stack[:40])
+        await self._discover_stack(stack)
+
+    async def async_initialize_entries(
+        self,
+        scan_interval_seconds: int = 10,
+        max_entries: int = 500,
+    ) -> Dict[str, int]:
+        """
+        One-time recursive stack discovery helper.
+
+        - Starts from configured `self.entries`.
+        - Recursively extracts nested `stack=` links from fetched pages.
+        - Enforces one stack fetch every `scan_interval_seconds`.
+        """
+        was_running = self._running and self._poll_task is not None
+        if was_running:
+            await self._stop_polling_for_maintenance()
+
+        queue: List[str] = list(self.entries)
+        known: set[str] = set(self.entries)
+        new_entries: List[str] = []
+        processed = 0
+        failed = 0
+        last_fetch_ts: Optional[float] = None
+
+        _LOGGER.info(
+            "Initialization scan started (seed=%d, interval=%ds, max=%d)",
+            len(queue), scan_interval_seconds, max_entries,
+        )
+
+        try:
+            while queue and processed < max_entries:
+                stack = queue.pop(0)
+
+                if last_fetch_ts is not None and scan_interval_seconds > 0:
+                    wait_seconds = scan_interval_seconds - (monotonic() - last_fetch_ts)
+                    if wait_seconds > 0:
+                        await asyncio.sleep(wait_seconds)
+
+                html = await self._fetch_stack_html(stack)
+                last_fetch_ts = monotonic()
+                processed += 1
+
+                if html is None:
+                    failed += 1
+                    continue
+
+                nested = _extract_stack_links_from_html(html)
+                for nested_stack in nested:
+                    if nested_stack not in known:
+                        known.add(nested_stack)
+                        self.entries.append(nested_stack)
+                        new_entries.append(nested_stack)
+                        queue.append(nested_stack)
+
+                params = parse_settings_page(html, stack)
+                if params is None:
+                    failed += 1
+                    continue
+                await self._store_discovered_params(stack, params)
+
+            _LOGGER.info(
+                "Initialization scan done: processed=%d, new_entries=%d, failed=%d, total_entries=%d",
+                processed,
+                len(new_entries),
+                failed,
+                len(self.entries),
+            )
+            return {
+                "processed": processed,
+                "new_entries": len(new_entries),
+                "failed": failed,
+                "total_entries": len(self.entries),
+            }
+        finally:
+            if was_running:
+                self._running = True
+                self._poll_task = asyncio.ensure_future(self._polling_loop())
+
+    async def _stop_polling_for_maintenance(self) -> None:
+        """Temporarily stop background polling while running maintenance tasks."""
+        self._running = False
+        self._write_event.set()
+        if self._poll_task:
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+            self._poll_task = None
+
+    async def _store_discovered_params(self, stack: str, params: List[ParsedParameter]) -> None:
+        """Persist parsed parameters and notify listeners."""
         # Remove stale failure marker once discovery succeeds again.
         failure_key = self.make_key(stack, "discovery_failed")
         self._parameters.pop(failure_key, None)
@@ -379,11 +489,6 @@ class WemCoordinator:
                     cb(stack, params)
             except Exception as exc:
                 _LOGGER.error("Error in new-param callback: %s", exc)
-
-    async def async_rediscover_stack(self, stack: str) -> None:
-        """Public API: re-run discovery for one stack (e.g. service call)."""
-        _LOGGER.info("Re-discovering stack: %s", stack[:40])
-        await self._discover_stack(stack)
 
     # ------------------------------------------------------------------
     # Main polling loop
@@ -629,3 +734,24 @@ def _parse_entries(raw: str) -> List[str]:
             return lines
     # Single entry
     return [raw.strip()] if raw.strip() else []
+
+
+def _extract_stack_links_from_html(html: str) -> List[str]:
+    """Extract all stack values from settings_export links in a page."""
+    soup = BeautifulSoup(html, "lxml")
+    found: List[str] = []
+    seen: set[str] = set()
+
+    for anchor in soup.find_all("a", href=True):
+        href = anchor.get("href", "")
+        if "settings_export.html" not in href or "stack=" not in href:
+            continue
+        parsed = urlparse(href)
+        query = parse_qs(parsed.query)
+        for raw_stack in query.get("stack", []):
+            stack = unquote(raw_stack).strip()
+            if stack and stack not in seen:
+                seen.add(stack)
+                found.append(stack)
+
+    return found

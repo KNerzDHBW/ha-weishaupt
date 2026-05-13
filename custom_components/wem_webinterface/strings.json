@@ -45,6 +45,20 @@
           "description": "Der Stack-String, der neu entdeckt werden soll (leer = alle)."
         }
       }
+    },
+    "initialize_scan": {
+      "name": "Initialisierungs-Scan",
+      "description": "Einmalige rekursive Erkennung aller verschachtelten Stack-Einträge mit begrenzter Abrufrate.",
+      "fields": {
+        "scan_interval": {
+          "name": "Scan-Intervall",
+          "description": "Sekunden zwischen zwei Stack-Abrufen (mindestens 10)."
+        },
+        "max_entries": {
+          "name": "Maximale Einträge",
+          "description": "Sicherheitsgrenze für die Anzahl der zu verarbeitenden Stacks."
+        }
+      }
     }
   }
 }

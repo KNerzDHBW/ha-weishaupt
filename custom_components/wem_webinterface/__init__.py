@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import ConfigEntryNotReady
 import voluptuous as vol
 import homeassistant.helpers.config_validation as cv
+import aiohttp
 
 from .const import CONF_ENTRIES, DOMAIN, PLATFORMS
 from .coordinator import WemCoordinator, _parse_entries
@@ -21,6 +24,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     try:
         await coordinator.async_setup()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        # Tell Home Assistant to retry setup later instead of marking the
+        # integration as permanently failed.
+        raise ConfigEntryNotReady(
+            f"Cannot reach WEM device {coordinator.ip_address}: {exc}"
+        ) from exc
     except Exception as exc:
         _LOGGER.error("Failed to set up WEM coordinator: %s", exc)
         raise
@@ -45,6 +54,39 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "rediscover",
             handle_rediscover,
             schema=vol.Schema({vol.Optional("stack"): cv.string}),
+        )
+
+    # --- Register service: wem_webinterface.initialize_scan ---
+    async def handle_initialize_scan(call: ServiceCall) -> None:
+        interval = int(call.data.get("scan_interval", 10))
+        max_entries = int(call.data.get("max_entries", 500))
+        result = await coordinator.async_initialize_entries(
+            scan_interval_seconds=interval,
+            max_entries=max_entries,
+        )
+        _LOGGER.info(
+            "Initialization scan finished: processed=%d new_entries=%d failed=%d total_entries=%d",
+            result["processed"],
+            result["new_entries"],
+            result["failed"],
+            result["total_entries"],
+        )
+
+    if not hass.services.has_service(DOMAIN, "initialize_scan"):
+        hass.services.async_register(
+            DOMAIN,
+            "initialize_scan",
+            handle_initialize_scan,
+            schema=vol.Schema(
+                {
+                    vol.Optional("scan_interval", default=10): vol.All(
+                        vol.Coerce(int), vol.Range(min=10, max=300)
+                    ),
+                    vol.Optional("max_entries", default=500): vol.All(
+                        vol.Coerce(int), vol.Range(min=1, max=5000)
+                    ),
+                }
+            ),
         )
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
