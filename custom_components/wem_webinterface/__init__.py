@@ -64,6 +64,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             scan_interval_seconds=interval,
             max_entries=max_entries,
         )
+        hass.config_entries.async_update_entry(
+            entry,
+            options={
+                **entry.options,
+                CONF_ENTRIES: "\n".join(coordinator.entries),
+            },
+        )
         _LOGGER.info(
             "Initialization scan finished: processed=%d new_entries=%d failed=%d total_entries=%d",
             result["processed"],
@@ -80,7 +87,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             schema=vol.Schema(
                 {
                     vol.Optional("scan_interval", default=10): vol.All(
-                        vol.Coerce(int), vol.Range(min=10, max=300)
+                        vol.Coerce(int), vol.Range(min=5, max=300)
                     ),
                     vol.Optional("max_entries", default=500): vol.All(
                         vol.Coerce(int), vol.Range(min=1, max=5000)

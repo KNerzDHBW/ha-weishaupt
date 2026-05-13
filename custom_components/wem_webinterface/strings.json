@@ -8,7 +8,7 @@
           "ip_address": "IP address or DNS name",
           "username": "Username",
           "password": "Password",
-          "entries": "Stack entries (one entry per line)"
+          "entries": "Stack entries (optional, one entry per line)"
         }
       }
     },
@@ -27,12 +27,16 @@
           "cycle_interval": "Cycle interval (seconds)",
           "retry_interval": "Retry interval when the page is incomplete (seconds)",
           "max_retries": "Maximum retries",
-          "entries": "Stack entries (one entry per line)"
+          "entries": "Stack entries (one entry per line)",
+          "init_scan_now": "Read all entries now (one-time full menu scan)",
+          "init_scan_interval": "Scan interval between page loads (seconds, minimum 5)",
+          "init_scan_max_entries": "Maximum entries to scan"
         }
       }
     },
     "error": {
-      "entries_empty": "At least one stack entry must be provided."
+      "entries_empty": "At least one stack entry must be provided.",
+      "init_scan_failed": "Automatic full scan failed. Check connection and retry."
     }
   },
   "services": {
@@ -52,7 +56,7 @@
       "fields": {
         "scan_interval": {
           "name": "Scan interval",
-          "description": "Seconds between stack fetches (minimum 10)."
+          "description": "Seconds between stack fetches (minimum 5)."
         },
         "max_entries": {
           "name": "Maximum entries",

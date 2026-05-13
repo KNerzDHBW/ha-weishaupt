@@ -20,7 +20,8 @@ Configure in the integration UI:
 - IP address or DNS name (e.g. `heizung.home`)
 - Username
 - Password
-- Stack entries (one stack per line)
+- Stack entries (one stack per line) [OPTIONAL]
+- In the configuration of the wem web interface read all entries.
 
 ## Notes
 

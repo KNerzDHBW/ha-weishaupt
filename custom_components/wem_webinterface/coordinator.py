@@ -116,7 +116,7 @@ class WemCoordinator:
     def from_config_entry(cls, hass, config_entry) -> "WemCoordinator":
         data = config_entry.data
         opts = config_entry.options
-        entries_raw = opts.get(CONF_ENTRIES, data[CONF_ENTRIES])
+        entries_raw = opts.get(CONF_ENTRIES, data.get(CONF_ENTRIES, ""))
         entries = _parse_entries(entries_raw)
         return cls(
             ip_address=data[CONF_IP_ADDRESS],
@@ -559,24 +559,51 @@ class WemCoordinator:
         if was_running:
             await self._stop_polling_for_maintenance()
 
+        effective_interval = max(5, int(scan_interval_seconds))
         queue: List[str] = list(self.entries)
         known: set[str] = set(self.entries)
         new_entries: List[str] = []
+        attempts: Dict[str, int] = {stack: 0 for stack in queue}
         processed = 0
         failed = 0
         last_fetch_ts: Optional[float] = None
 
         _LOGGER.info(
             "Initialization scan started (seed=%d, interval=%ds, max=%d)",
-            len(queue), scan_interval_seconds, max_entries,
+            len(queue), effective_interval, max_entries,
         )
+
+        if not queue:
+            try:
+                async with self._session.get(
+                    f"{self.base_url}/home.html",
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    allow_redirects=True,
+                ) as resp:
+                    home_html = await resp.text()
+                    for nested_stack in _extract_stack_links_from_html(home_html):
+                        if nested_stack not in known:
+                            known.add(nested_stack)
+                            self.entries.append(nested_stack)
+                            new_entries.append(nested_stack)
+                            queue.append(nested_stack)
+                            attempts[nested_stack] = 0
+                _LOGGER.info(
+                    "Initialization scan bootstrapped %d entries from home page",
+                    len(queue),
+                )
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                _LOGGER.warning(
+                    "Initialization scan could not bootstrap entries from home page: %s",
+                    exc,
+                )
 
         try:
             while queue and processed < max_entries:
                 stack = queue.pop(0)
 
-                if last_fetch_ts is not None and scan_interval_seconds > 0:
-                    wait_seconds = scan_interval_seconds - (monotonic() - last_fetch_ts)
+                if last_fetch_ts is not None and effective_interval > 0:
+                    wait_seconds = effective_interval - (monotonic() - last_fetch_ts)
                     if wait_seconds > 0:
                         await asyncio.sleep(wait_seconds)
 
@@ -585,7 +612,16 @@ class WemCoordinator:
                 processed += 1
 
                 if html is None:
-                    failed += 1
+                    attempts[stack] = attempts.get(stack, 0) + 1
+                    if attempts[stack] < 3 and processed < max_entries:
+                        _LOGGER.warning(
+                            "Initialization scan transient failure on stack %s (attempt %d/3), re-queueing",
+                            stack[:40],
+                            attempts[stack],
+                        )
+                        queue.append(stack)
+                    else:
+                        failed += 1
                     continue
 
                 nested = _extract_stack_links_from_html(html)
