@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import platform
+import socket
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from time import monotonic
@@ -169,7 +172,8 @@ class WemCoordinator:
     async def async_setup(self) -> None:
         """Login, discover all stacks, then start background polling."""
         await self._create_session()
-        await self._check_reachability()
+        await self._check_ip_reachability()
+        await self._check_web_port_reachability()
         await self._login()
         await self._discover_all()
         self._running = True
@@ -199,18 +203,59 @@ class WemCoordinator:
         jar = aiohttp.CookieJar(unsafe=True)
         self._session = aiohttp.ClientSession(connector=connector, cookie_jar=jar)
 
-    async def _check_reachability(self, timeout_seconds: int = 5) -> None:
-        """Lightweight reachability check before attempting the login."""
+    async def _check_ip_reachability(self, timeout_seconds: int = 5) -> None:
+        """Check whether the target IP is reachable by sending a single ping."""
+        system = platform.system().lower()
+        if system.startswith("win"):
+            command = ["ping", "-n", "1", "-w", str(timeout_seconds * 1000), self.ip_address]
+        else:
+            command = ["ping", "-c", "1", "-W", str(timeout_seconds), self.ip_address]
+
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise ConnectionError(
+                "Ping command not available on this system. Cannot check IP reachability first."
+            ) from exc
+
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout or "").strip()
+            detail = f": {stderr}" if stderr else ""
+            raise ConnectionError(
+                f"WEM device {self.ip_address} is not reachable on the network (ping failed){detail}"
+            )
+
+    async def _check_web_port_reachability(self, timeout_seconds: int = 5) -> None:
+        """Check whether the web interface is reachable on port 80."""
         try:
             connect = asyncio.open_connection(self.ip_address, 80)
             reader, writer = await asyncio.wait_for(connect, timeout=timeout_seconds)
             writer.close()
             if hasattr(writer, "wait_closed"):
                 await writer.wait_closed()
+        except asyncio.TimeoutError as exc:
+            raise ConnectionError(
+                f"WEM device {self.ip_address} did not answer on port 80 within {timeout_seconds}s."
+            ) from exc
+        except (ConnectionRefusedError, OSError, socket.gaierror) as exc:
+            raise ConnectionError(
+                f"WEM device {self.ip_address} is not reachable on port 80. Network or firewall problem: {exc.__class__.__name__}."
+            ) from exc
         except Exception as exc:
             raise ConnectionError(
-                f"WEM device {self.ip_address} is not reachable on port 80 (checked for {timeout_seconds}s): {exc}"
+                f"WEM device {self.ip_address} is not reachable on port 80. Unexpected error: {exc.__class__.__name__}."
             ) from exc
+
+    async def _check_reachability(self, timeout_seconds: int = 5) -> None:
+        """Backward-compatible wrapper for the two-step reachability check."""
+        await self._check_ip_reachability(timeout_seconds=timeout_seconds)
+        await self._check_web_port_reachability(timeout_seconds=timeout_seconds)
 
     async def _login(self) -> None:
         """Perform form-based login and persist the session cookie."""

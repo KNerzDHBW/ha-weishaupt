@@ -27,6 +27,16 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def _safe_int(value: Any, default: int) -> int:
+    """Best-effort int conversion for persisted options values."""
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle the initial setup flow."""
 
@@ -96,20 +106,29 @@ class WemOptionsFlow(config_entries.OptionsFlow):
 
         opts = self.config_entry.options
         data = self.config_entry.data
-        entries_default = opts.get(CONF_ENTRIES, data.get(CONF_ENTRIES, ""))
+        entries_default = str(opts.get(CONF_ENTRIES, data.get(CONF_ENTRIES, "")) or "")
         options_schema = vol.Schema(
             {
                 vol.Optional(
                     CONF_CYCLE_INTERVAL,
-                    default=int(opts.get(CONF_CYCLE_INTERVAL, DEFAULT_CYCLE_INTERVAL)),
+                    default=_safe_int(
+                        opts.get(CONF_CYCLE_INTERVAL, DEFAULT_CYCLE_INTERVAL),
+                        DEFAULT_CYCLE_INTERVAL,
+                    ),
                 ): vol.All(vol.Coerce(int), vol.Range(min=5, max=3600)),
                 vol.Optional(
                     CONF_RETRY_INTERVAL,
-                    default=int(opts.get(CONF_RETRY_INTERVAL, DEFAULT_RETRY_INTERVAL)),
+                    default=_safe_int(
+                        opts.get(CONF_RETRY_INTERVAL, DEFAULT_RETRY_INTERVAL),
+                        DEFAULT_RETRY_INTERVAL,
+                    ),
                 ): vol.All(vol.Coerce(int), vol.Range(min=1, max=60)),
                 vol.Optional(
                     CONF_MAX_RETRIES,
-                    default=int(opts.get(CONF_MAX_RETRIES, DEFAULT_MAX_RETRIES)),
+                    default=_safe_int(
+                        opts.get(CONF_MAX_RETRIES, DEFAULT_MAX_RETRIES),
+                        DEFAULT_MAX_RETRIES,
+                    ),
                 ): vol.All(vol.Coerce(int), vol.Range(min=1, max=10)),
                 vol.Optional(
                     CONF_ENTRIES,

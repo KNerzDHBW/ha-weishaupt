@@ -29,9 +29,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except (ConnectionError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
         # Tell Home Assistant to retry setup later instead of marking the
         # integration as permanently failed.
-        raise ConfigEntryNotReady(
-            f"Cannot reach WEM device {coordinator.ip_address}: {exc}"
-        ) from exc
+        raise ConfigEntryNotReady(str(exc)) from exc
     except Exception as exc:
         _LOGGER.error("Failed to set up WEM coordinator: %s", exc)
         raise
