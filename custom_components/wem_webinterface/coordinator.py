@@ -958,12 +958,24 @@ class WemCoordinator:
 
         url = f"{self.base_url}/settings_export.html?stack={stack}"
         field_name = info.form_field_name or "value"
+        
+        # Check if this parameter uses 10x scaling (e.g., 20.5°C stored as 205)
+        write_value = value
+        if info.write_fields and info.write_fields.get("__scaling_factor__") == "10":
+            # Apply scaling: multiply by 10 when writing
+            try:
+                write_value = float(value) * 10
+                _LOGGER.debug("Applying 10x scaling for write: %s → %s", value, write_value)
+            except (ValueError, TypeError):
+                pass
 
         for attempt in range(1, DEFAULT_MAX_WRITE_RETRIES + 1):
             # 1. Write
             try:
                 payload = dict(info.write_fields or {})
-                payload[info.form_field_name or field_name] = str(value)
+                # Remove marker fields before sending
+                payload.pop("__scaling_factor__", None)
+                payload[info.form_field_name or field_name] = str(write_value)
                 async with self._session.post(
                     f"{self.base_url}/{(info.write_action or 'pro_save.html').lstrip('/')}",
                     data=payload,

@@ -252,12 +252,25 @@ def _leaf_label(form: Tag) -> str:
 
 
 def _detect_step(values: List[float]) -> Optional[float]:
+    """Detect step size from sorted option values.
+    
+    If all differences are multiples of 10, and individual values look like
+    they may be scaled by 10 (e.g., 205 instead of 20.5), return 0.1 instead of 1.
+    """
     if len(values) < 2:
         return None
     diffs = [round(values[i + 1] - values[i], 10) for i in range(len(values) - 1) if values[i + 1] > values[i]]
     if not diffs:
         return None
-    return min(diffs)
+    
+    base_step = min(diffs)
+    # Detect scaled values: if smallest diff is 10 and values are all divisible by 10,
+    # likely the device stores 20.5 as 205, so report step as 0.1 not 1
+    if base_step >= 10:
+        if all(v % 10 == 0 for v in values if v > 0):
+            return base_step / 10.0
+    
+    return base_step
 
 
 def _infer_unit(node: Tag, labels: List[str]) -> str:
@@ -338,6 +351,7 @@ def _parse_single_form(form: Tag, soup: BeautifulSoup, stack: str) -> Optional[P
         return None
 
     param_id = _slugify(name)
+    scaling_factor = 1.0
 
     # --- select element → string options ---
     sel_elem = form.find("select")
@@ -378,6 +392,8 @@ def _parse_single_form(form: Tag, soup: BeautifulSoup, stack: str) -> Optional[P
         return None
 
     raw_val = value_input.get("value", "")
+    raw_float = _to_float(raw_val)
+    
     # Prefer explicit min/max/step from input attributes if not found in hiddens
     if min_val is None:
         min_val = _to_float(value_input.get("min"))
@@ -385,14 +401,30 @@ def _parse_single_form(form: Tag, soup: BeautifulSoup, stack: str) -> Optional[P
         max_val = _to_float(value_input.get("max"))
     if step_val is None:
         step_val = _to_float(value_input.get("step"))
+    
+    # Detect if values are scaled by 10 (e.g., WEM stores 20.5°C as 205)
+    # Heuristic: step is ~0.1 but raw value is >= 10
+    if step_val is not None and raw_float is not None:
+        if 0.05 < step_val < 1.0 and abs(step_val - 0.1) < 0.05:
+            if raw_float >= 10:
+                scaling_factor = 10.0
+                _LOGGER.debug("Detected 10x scaling for %s (step=%.2f, raw_val=%.1f)", name, step_val, raw_float)
 
     current_value = _to_float(raw_val)
     if current_value is None:
         current_value = raw_val
+    elif scaling_factor == 10.0 and current_value is not None:
+        current_value = current_value / scaling_factor
+        if min_val is not None:
+            min_val = min_val / scaling_factor
+        if max_val is not None:
+            max_val = max_val / scaling_factor
+        if step_val is not None:
+            step_val = step_val / scaling_factor
 
     unit = _extract_unit(soup)
 
-    return ParsedParameter(
+    param = ParsedParameter(
         param_id=param_id,
         name=name,
         current_value=current_value,
@@ -403,6 +435,12 @@ def _parse_single_form(form: Tag, soup: BeautifulSoup, stack: str) -> Optional[P
         step=step_val if step_val is not None else 1.0,
         form_field_name=value_input.get("name") or "value",
     )
+    
+    # Store scaling factor as marker for later write operations
+    if scaling_factor == 10.0:
+        param.write_fields = {"__scaling_factor__": "10"}
+    
+    return param
 
 
 # ---------------------------------------------------------------------------

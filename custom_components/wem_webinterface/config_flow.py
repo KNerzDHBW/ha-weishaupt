@@ -166,10 +166,22 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data=self._pending_user_input,
                 )
 
+            try:
+                placeholders = self._autoscan_description_placeholders()
+            except Exception as exc:
+                _LOGGER.debug("Error in progress placeholders: %s", exc)
+                placeholders = {
+                    "root_done": "0",
+                    "root_total": "1",
+                    "root_current_index": "1",
+                    "root_current_label": "(scanning)",
+                    "processed": "0",
+                }
+
             return self.async_show_form(
                 step_id="autoscan",
                 data_schema=vol.Schema({}),
-                description_placeholders=self._autoscan_description_placeholders(),
+                description_placeholders=placeholders,
             )
 
         try:
