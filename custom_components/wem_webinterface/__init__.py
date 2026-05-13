@@ -7,7 +7,7 @@ import asyncio
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 import voluptuous as vol
 import homeassistant.helpers.config_validation as cv
 import aiohttp
@@ -24,7 +24,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     try:
         await coordinator.async_setup()
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+    except PermissionError as exc:
+        raise ConfigEntryAuthFailed(str(exc)) from exc
+    except (ConnectionError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
         # Tell Home Assistant to retry setup later instead of marking the
         # integration as permanently failed.
         raise ConfigEntryNotReady(

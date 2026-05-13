@@ -2,61 +2,61 @@
   "config": {
     "step": {
       "user": {
-        "title": "WEM Web Interface einrichten",
-        "description": "Verbindung zum WEM-Gerät konfigurieren.",
+        "title": "Set up WEM Web Interface",
+        "description": "Configure the connection to the WEM device.",
         "data": {
-          "ip_address": "IP-Adresse",
-          "username": "Benutzername",
-          "password": "Passwort",
-          "entries": "Stack-Einträge (eine Zeile pro Eintrag)"
+          "ip_address": "IP address",
+          "username": "Username",
+          "password": "Password",
+          "entries": "Stack entries (one entry per line)"
         }
       }
     },
     "error": {
-      "entries_empty": "Es muss mindestens ein Stack-Eintrag angegeben werden."
+      "entries_empty": "At least one stack entry must be provided."
     },
     "abort": {
-      "already_configured": "Gerät ist bereits konfiguriert."
+      "already_configured": "The device is already configured."
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "WEM Optionen",
+        "title": "WEM options",
         "data": {
-          "cycle_interval": "Zyklusintervall (Sekunden)",
-          "retry_interval": "Wiederholungsintervall bei unvollständiger Seite (Sekunden)",
-          "max_retries": "Maximale Wiederholungsversuche",
-          "entries": "Stack-Einträge (eine Zeile pro Eintrag)"
+          "cycle_interval": "Cycle interval (seconds)",
+          "retry_interval": "Retry interval when the page is incomplete (seconds)",
+          "max_retries": "Maximum retries",
+          "entries": "Stack entries (one entry per line)"
         }
       }
     },
     "error": {
-      "entries_empty": "Es muss mindestens ein Stack-Eintrag angegeben werden."
+      "entries_empty": "At least one stack entry must be provided."
     }
   },
   "services": {
     "rediscover": {
-      "name": "Parameter neu entdecken",
-      "description": "Liest Metadaten (Wertebereich, Typ, …) für einen Stack-Eintrag neu aus.",
+      "name": "Rediscover parameters",
+      "description": "Rediscover metadata (range, type, etc.) for one stack entry.",
       "fields": {
         "stack": {
           "name": "Stack",
-          "description": "Der Stack-String, der neu entdeckt werden soll (leer = alle)."
+          "description": "The stack string to rediscover (empty = all)."
         }
       }
     },
     "initialize_scan": {
-      "name": "Initialisierungs-Scan",
-      "description": "Einmalige rekursive Erkennung aller verschachtelten Stack-Einträge mit begrenzter Abrufrate.",
+      "name": "Initialization scan",
+      "description": "One-time recursive discovery of nested stack entries with rate limiting.",
       "fields": {
         "scan_interval": {
-          "name": "Scan-Intervall",
-          "description": "Sekunden zwischen zwei Stack-Abrufen (mindestens 10)."
+          "name": "Scan interval",
+          "description": "Seconds between stack fetches (minimum 10)."
         },
         "max_entries": {
-          "name": "Maximale Einträge",
-          "description": "Sicherheitsgrenze für die Anzahl der zu verarbeitenden Stacks."
+          "name": "Maximum entries",
+          "description": "Safety limit for the number of stacks to process."
         }
       }
     }

@@ -169,6 +169,7 @@ class WemCoordinator:
     async def async_setup(self) -> None:
         """Login, discover all stacks, then start background polling."""
         await self._create_session()
+        await self._check_reachability()
         await self._login()
         await self._discover_all()
         self._running = True
@@ -197,6 +198,19 @@ class WemCoordinator:
         connector = aiohttp.TCPConnector(ssl=False)
         jar = aiohttp.CookieJar(unsafe=True)
         self._session = aiohttp.ClientSession(connector=connector, cookie_jar=jar)
+
+    async def _check_reachability(self, timeout_seconds: int = 5) -> None:
+        """Lightweight reachability check before attempting the login."""
+        try:
+            connect = asyncio.open_connection(self.ip_address, 80)
+            reader, writer = await asyncio.wait_for(connect, timeout=timeout_seconds)
+            writer.close()
+            if hasattr(writer, "wait_closed"):
+                await writer.wait_closed()
+        except Exception as exc:
+            raise ConnectionError(
+                f"WEM device {self.ip_address} is not reachable on port 80 (checked for {timeout_seconds}s): {exc}"
+            ) from exc
 
     async def _login(self) -> None:
         """Perform form-based login and persist the session cookie."""
@@ -250,10 +264,19 @@ class WemCoordinator:
                 timeout=aiohttp.ClientTimeout(total=15),
                 allow_redirects=True,
             ) as resp:
-                if resp.status == 200:
+                login_response_html = await resp.text()
+                login_response_soup = BeautifulSoup(login_response_html, "lxml")
+                final_login_path = urlparse(str(resp.url)).path
+
+                if final_login_path.endswith("/login.html") or is_login_page(login_response_soup):
+                    raise PermissionError(
+                        f"Invalid username/password for WEM device {self.ip_address}"
+                    )
+
+                if final_login_path.endswith("/home.html"):
                     _LOGGER.info("Login successful to %s", self.base_url)
                 else:
-                    _LOGGER.warning("Login returned HTTP %d", resp.status)
+                    _LOGGER.info("Login completed for %s (final URL: %s)", self.base_url, resp.url)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             _LOGGER.error("Login POST failed: %s", exc)
             raise
