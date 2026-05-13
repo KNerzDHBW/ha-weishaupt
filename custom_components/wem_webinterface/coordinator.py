@@ -150,6 +150,15 @@ class WemCoordinator:
     def get_all_parameters(self) -> List[ParameterInfo]:
         return list(self._parameters.values())
 
+    @staticmethod
+    def _has_usable_value(value: Any) -> bool:
+        """Return True if a parsed value should replace the current entity state."""
+        if value is None:
+            return False
+        if isinstance(value, str) and not value.strip():
+            return False
+        return True
+
     # ------------------------------------------------------------------
     # Callback registration (used by HA entities)
     # ------------------------------------------------------------------
@@ -937,6 +946,7 @@ class WemCoordinator:
             return None
 
         seen_param_ids: set[str] = set()
+        usable_param_ids: set[str] = set()
 
         for p in params:
             seen_param_ids.add(p.param_id)
@@ -972,17 +982,26 @@ class WemCoordinator:
             info.write_fields = p.write_fields
 
             old_val = info.current_value
-            info.current_value = p.current_value
-            info.last_updated = datetime.now()
+            if self._has_usable_value(p.current_value):
+                usable_param_ids.add(p.param_id)
+                info.current_value = p.current_value
+                info.last_updated = datetime.now()
 
-            if old_val != p.current_value:
+                if old_val != p.current_value:
+                    _LOGGER.debug(
+                        "Value changed: %s  %s → %s", p.name, old_val, p.current_value
+                    )
+                    await self._fire_callbacks(key)
+            else:
                 _LOGGER.debug(
-                    "Value changed: %s  %s → %s", p.name, old_val, p.current_value
+                    "Ignoring unusable value for %s on stack %s; keeping last known value=%s",
+                    p.name,
+                    stack[:40],
+                    old_val,
                 )
-                await self._fire_callbacks(key)
 
         if track_missing and known_param_ids:
-            missing = known_param_ids - seen_param_ids
+            missing = known_param_ids - usable_param_ids
             if missing:
                 self._missing_values_retry[stack] = missing
                 _LOGGER.warning(
@@ -993,7 +1012,7 @@ class WemCoordinator:
             else:
                 self._missing_values_retry.pop(stack, None)
 
-        return seen_param_ids
+        return usable_param_ids
 
     # ------------------------------------------------------------------
     # Value callbacks
