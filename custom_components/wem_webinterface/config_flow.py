@@ -235,8 +235,10 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             in_flight = 1 if current_index > 0 and done < total else 0
             ratio = min(1.0, (done + in_flight * 0.5) / total)
 
-        self.async_update_progress(ratio)
-        self.async_notify_flow_changed()
+        try:
+            self.async_update_progress(ratio)
+        except Exception as exc:
+            _LOGGER.debug("Failed to update progress: %s", exc)
 
     async def _run_initial_autoscan(self, user_input: Dict[str, Any]) -> Dict[str, Any]:
         """Run one automatic full scan during initial setup."""
