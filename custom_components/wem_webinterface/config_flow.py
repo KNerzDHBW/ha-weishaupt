@@ -186,11 +186,11 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         try:
             self._autoscan_result = self._autoscan_task.result()
-            return self.async_show_progress_done(next_step_id="autoscan_summary")
+            return await self.async_step_autoscan_summary()
         except Exception as exc:
             self._autoscan_error = exc
             _LOGGER.exception("Automatic initialization scan failed")
-            return self.async_show_progress_done(next_step_id="autoscan_failed")
+            return await self.async_step_autoscan_failed()
 
     async def _cancel_autoscan_task(self) -> None:
         """Cancel running autoscan task when user chooses to skip."""
