@@ -412,32 +412,36 @@ class WemCoordinator:
             raise
 
     async def _is_authenticated_session(self) -> bool:
-        """Validate that the current cookie/session can access a protected page."""
-        probe_urls: List[str] = [f"{self.base_url}/home.html"]
-        if self.entries:
-            probe_urls.append(f"{self.base_url}/settings_export.html?stack={self.entries[0]}")
+        """Validate that the current session can access a protected page.
 
-        for probe_url in probe_urls:
-            try:
-                async with self._session.get(
-                    probe_url,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    allow_redirects=True,
-                ) as probe_resp:
-                    probe_html = await probe_resp.text()
-                    probe_soup = BeautifulSoup(probe_html, "lxml")
-                    probe_path = urlparse(str(probe_resp.url)).path
-                    unauthenticated = (
-                        probe_resp.status in (401, 403)
-                        or probe_path.endswith("/login.html")
-                        or is_login_page(probe_soup)
-                    )
-                    if not unauthenticated:
-                        return True
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                continue
+        Uses a stack URL when available because /home.html on many WEM
+        firmware versions redirects to /login.html regardless of auth state.
+        Falls back to trusting the session cookie when no stack is configured.
+        """
+        if not self.entries:
+            # No stack to probe – trust that the POST set a valid cookie.
+            # The next actual fetch will re-login if needed.
+            return True
 
-        return False
+        probe_url = f"{self.base_url}/settings_export.html?stack={self.entries[0]}"
+        try:
+            async with self._session.get(
+                probe_url,
+                timeout=aiohttp.ClientTimeout(total=15),
+                allow_redirects=True,
+            ) as probe_resp:
+                probe_html = await probe_resp.text()
+                probe_soup = BeautifulSoup(probe_html, "lxml")
+                probe_path = urlparse(str(probe_resp.url)).path
+                unauthenticated = (
+                    probe_resp.status in (401, 403)
+                    or probe_path.endswith("/login.html")
+                    or is_login_page(probe_soup)
+                )
+                return not unauthenticated
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            # Network hiccup – assume session is valid, polling will fix it.
+            return True
 
     # ------------------------------------------------------------------
     # Fetch a stack (with retries for incomplete pages)

@@ -1,4 +1,4 @@
-# WEM Web Interface (Home Assistant), v0.1.7
+# WEM Web Interface (Home Assistant), v0.1.8
 
 Custom integration for Home Assistant to read and write values from the local WEM web interface.
 
