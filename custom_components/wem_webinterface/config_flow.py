@@ -78,6 +78,14 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._autoscan_task: Optional[Any] = None
         self._autoscan_result: Optional[Dict[str, Any]] = None
         self._autoscan_error: Optional[Exception] = None
+        self._autoscan_progress: Dict[str, Any] = {
+            "root_total": 0,
+            "root_done": 0,
+            "root_current_index": 0,
+            "root_current_stack": "",
+            "root_current_menu": "",
+            "processed": 0,
+        }
 
     async def async_step_user(
         self, user_input: Optional[Dict[str, Any]] = None
@@ -88,6 +96,14 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._pending_user_input = dict(user_input)
             self._autoscan_result = None
             self._autoscan_error = None
+            self._autoscan_progress = {
+                "root_total": 0,
+                "root_done": 0,
+                "root_current_index": 0,
+                "root_current_stack": "",
+                "root_current_menu": "",
+                "processed": 0,
+            }
 
             try:
                 self._autoscan_task = self.hass.async_create_task(
@@ -133,6 +149,7 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_show_progress(
                 step_id="autoscan",
                 progress_action="initial_autoscan",
+                description_placeholders=self._autoscan_description_placeholders(),
                 progress_task=self._autoscan_task,
             )
 
@@ -181,6 +198,46 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
+    def _autoscan_description_placeholders(self) -> Dict[str, str]:
+        """Return placeholders for the progress text shown during autoscan."""
+        total = int(self._autoscan_progress.get("root_total", 0) or 0)
+        done = int(self._autoscan_progress.get("root_done", 0) or 0)
+        current_index = int(self._autoscan_progress.get("root_current_index", 0) or 0)
+        current_menu = str(self._autoscan_progress.get("root_current_menu", "") or "").strip()
+        current_stack = str(self._autoscan_progress.get("root_current_stack", "") or "").strip()
+        processed = int(self._autoscan_progress.get("processed", 0) or 0)
+
+        if current_menu:
+            label = current_menu[:70]
+        elif current_stack:
+            label = current_stack[:42] + ("..." if len(current_stack) > 42 else "")
+        else:
+            label = "(waiting for first menu)"
+
+        return {
+            "root_done": str(done),
+            "root_total": str(max(total, 1)),
+            "root_current_index": str(current_index if current_index > 0 else 1),
+            "root_current_label": label,
+            "processed": str(processed),
+        }
+
+    async def _on_autoscan_progress(self, progress: Dict[str, Any]) -> None:
+        """Receive live scan progress and push it to the frontend."""
+        self._autoscan_progress.update(progress)
+
+        total = int(self._autoscan_progress.get("root_total", 0) or 0)
+        done = int(self._autoscan_progress.get("root_done", 0) or 0)
+        current_index = int(self._autoscan_progress.get("root_current_index", 0) or 0)
+
+        ratio = 0.0
+        if total > 0:
+            in_flight = 1 if current_index > 0 and done < total else 0
+            ratio = min(1.0, (done + in_flight * 0.5) / total)
+
+        self.async_update_progress(ratio)
+        self.async_notify_flow_changed()
+
     async def _run_initial_autoscan(self, user_input: Dict[str, Any]) -> Dict[str, Any]:
         """Run one automatic full scan during initial setup."""
         temp_coordinator = WemCoordinator(
@@ -203,6 +260,7 @@ class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             scan_result = await temp_coordinator.async_initialize_entries(
                 scan_interval_seconds=5,
                 max_entries=500,
+                progress_callback=self._on_autoscan_progress,
             )
             user_input[CONF_ENTRIES] = "\n".join(temp_coordinator.entries)
             return scan_result

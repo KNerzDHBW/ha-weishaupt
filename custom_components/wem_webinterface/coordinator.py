@@ -20,7 +20,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from time import monotonic
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
@@ -440,6 +440,7 @@ class WemCoordinator:
         self,
         scan_interval_seconds: int = 10,
         max_entries: int = 500,
+        progress_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None] | None]] = None,
     ) -> Dict[str, int]:
         """
         One-time recursive stack discovery helper.
@@ -461,6 +462,31 @@ class WemCoordinator:
         processed = 0
         failed = 0
         last_fetch_ts: Optional[float] = None
+        root_entries: List[str] = list(queue)
+        root_index: Dict[str, int] = {stack: idx + 1 for idx, stack in enumerate(root_entries)}
+        root_done: set[str] = set()
+        current_root_stack: str = ""
+
+        async def _emit_progress(current_menu: str = "") -> None:
+            if progress_callback is None:
+                return
+
+            current_idx = root_index.get(current_root_stack, 0)
+            payload: Dict[str, Any] = {
+                "root_total": len(root_entries),
+                "root_done": len(root_done),
+                "root_current_index": current_idx,
+                "root_current_stack": current_root_stack,
+                "root_current_menu": current_menu,
+                "processed": processed,
+                "max_entries": max_entries,
+            }
+            try:
+                maybe_coro = progress_callback(payload)
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+            except Exception as exc:
+                _LOGGER.debug("Progress callback failed: %s", exc)
 
         _LOGGER.info(
             "Initialization scan started (seed=%d, interval=%ds, max=%d)",
@@ -486,6 +512,8 @@ class WemCoordinator:
                     "Initialization scan bootstrapped %d entries from home page",
                     len(queue),
                 )
+                root_entries = list(queue)
+                root_index = {stack: idx + 1 for idx, stack in enumerate(root_entries)}
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 _LOGGER.warning(
                     "Initialization scan could not bootstrap entries from home page: %s",
@@ -493,8 +521,12 @@ class WemCoordinator:
                 )
 
         try:
+            await _emit_progress()
             while queue and processed < max_entries:
                 stack = queue.pop(0)
+                if stack in root_index:
+                    current_root_stack = stack
+                    await _emit_progress()
 
                 if last_fetch_ts is not None and effective_interval > 0:
                     wait_seconds = effective_interval - (monotonic() - last_fetch_ts)
@@ -534,6 +566,9 @@ class WemCoordinator:
                                 "found_nested": 0,
                             }
                         )
+                    if stack in root_index:
+                        root_done.add(stack)
+                        await _emit_progress("(failed)")
                     continue
 
                 nested = _extract_stack_links_from_html(html)
@@ -559,6 +594,9 @@ class WemCoordinator:
                             "found_nested": nested_added,
                         }
                     )
+                    if stack in root_index:
+                        root_done.add(stack)
+                        await _emit_progress("(unparsed)")
                     continue
                 await self._store_discovered_params(stack, params)
 
@@ -578,6 +616,11 @@ class WemCoordinator:
                     }
                 )
 
+                if stack in root_index:
+                    root_done.add(stack)
+                    await _emit_progress(menu_name)
+
+            await _emit_progress()
             _LOGGER.info(
                 "Initialization scan done: processed=%d, new_entries=%d, failed=%d, total_entries=%d",
                 processed,

@@ -21,7 +21,7 @@
       }
     },
     "progress": {
-      "initial_autoscan": "WEM-Menüs werden rekursiv gescannt (mindestens 5 Sekunden zwischen Seitenabrufen)."
+      "initial_autoscan": "Hauptmenü-Scan {root_done}/{root_total}. Prüfe {root_current_index}/{root_total}: {root_current_label}. Verarbeitete Seiten: {processed}."
     },
     "error": {
       "entries_empty": "Es muss mindestens ein Stack-Eintrag angegeben werden.",

@@ -21,7 +21,7 @@
       }
     },
     "progress": {
-      "initial_autoscan": "Scanning WEM menus recursively (minimum 5s between page loads)."
+      "initial_autoscan": "Main menu scan {root_done}/{root_total}. Checking {root_current_index}/{root_total}: {root_current_label}. Processed pages: {processed}."
     },
     "error": {
       "entries_empty": "At least one stack entry must be provided.",
