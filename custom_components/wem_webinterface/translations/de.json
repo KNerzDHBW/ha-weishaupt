@@ -24,7 +24,8 @@
       "initial_autoscan": "WEM-Menüs werden rekursiv gescannt (mindestens 5 Sekunden zwischen Seitenabrufen)."
     },
     "error": {
-      "entries_empty": "Es muss mindestens ein Stack-Eintrag angegeben werden."
+      "entries_empty": "Es muss mindestens ein Stack-Eintrag angegeben werden.",
+      "init_scan_failed": "Automatischer Vollscan fehlgeschlagen. Verbindung prüfen und erneut versuchen."
     },
     "abort": {
       "already_configured": "Gerät ist bereits konfiguriert."

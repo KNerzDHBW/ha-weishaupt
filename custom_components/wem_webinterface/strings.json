@@ -24,7 +24,8 @@
       "initial_autoscan": "Scanning WEM menus recursively (minimum 5s between page loads)."
     },
     "error": {
-      "entries_empty": "At least one stack entry must be provided."
+      "entries_empty": "At least one stack entry must be provided.",
+      "init_scan_failed": "Automatic full scan failed. Check connection and retry."
     },
     "abort": {
       "already_configured": "The device is already configured."
