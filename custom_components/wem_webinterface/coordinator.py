@@ -292,156 +292,45 @@ class WemCoordinator:
         await self._check_web_port_reachability(timeout_seconds=timeout_seconds)
 
     async def _login(self) -> None:
-        """Perform form-based login and persist the session cookie."""
-        login_url = self.base_url
+        """Perform form-based login and persist the session cookie.
+
+        Strategy: POST user/pass to /login.html and trust the cookie the
+        device sets.  Whether the credentials are correct is validated lazily
+        by _fetch_stack_html (which will keep receiving the login page and
+        eventually give up if the password is wrong).  Doing an explicit probe
+        here is unreliable because many WEM firmware versions redirect
+        *every* page – including protected ones – to /login.html in ways
+        that defeat simple heuristics.
+        """
+        # GET the base URL first so the session has any pre-login cookies.
         try:
             async with self._session.get(
-                login_url, timeout=aiohttp.ClientTimeout(total=15), allow_redirects=True
+                self.base_url, timeout=aiohttp.ClientTimeout(total=15), allow_redirects=True
             ) as resp:
-                login_html = await resp.text()
+                await resp.read()   # discard – we just want the cookie/session warm-up
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             _LOGGER.error(
-                "Cannot reach device at %s (login GET): %s (%r)",
-                login_url,
+                "Cannot reach device at %s: %s (%r)",
+                self.base_url,
                 exc.__class__.__name__,
                 exc,
             )
             raise
 
-        soup = BeautifulSoup(login_html, "lxml")
-        form = soup.find("form")
-
-        if not form:
-            # Some devices serve the form only on /login.html.
-            explicit_login_url = f"{self.base_url}/login.html"
-            try:
-                async with self._session.get(
-                    explicit_login_url,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    allow_redirects=True,
-                ) as resp:
-                    login_html = await resp.text()
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                _LOGGER.error(
-                    "Cannot reach explicit login page at %s: %s (%r)",
-                    explicit_login_url,
-                    exc.__class__.__name__,
-                    exc,
-                )
-                raise
-
-            soup = BeautifulSoup(login_html, "lxml")
-            form = soup.find("form")
-
-        hidden_fields: Dict[str, str] = {}
-        action = f"{self.base_url}/login.html"
-        user_field = "user"
-        pass_field = "pass"
-
-        if form:
-            # Collect hidden fields (CSRF tokens etc.)
-            for inp in form.find_all("input", {"type": "hidden"}):
-                n = inp.get("name")
-                if n:
-                    hidden_fields[n] = inp.get("value", "")
-
-            # Identify username / password field names
-            for inp in form.find_all("input"):
-                itype = (inp.get("type") or "text").lower()
-                iname = (inp.get("name") or "").lower()
-                if not iname:
-                    continue
-
-                if itype in ("text", "email") or any(
-                    k in iname for k in ("user", "username", "login", "name")
-                ):
-                    user_field = inp.get("name", user_field)
-                elif itype == "password" or any(k in iname for k in ("pass", "pwd")):
-                    pass_field = inp.get("name", pass_field)
-
-            raw_action = form.get("action", "/")
-            if raw_action.startswith("http"):
-                action = raw_action
-            else:
-                candidate = raw_action.strip()
-                if candidate in ("", "/"):
-                    action = f"{self.base_url}/login.html"
-                else:
-                    action = self.base_url + "/" + candidate.lstrip("/")
-
+        # POST credentials – always use the well-known WEM field names.
         try:
-            # Attempt 1: exact legacy WEM form expected by many devices.
-            primary_data: Dict[str, str] = dict(hidden_fields)
-            primary_data["user"] = self.username
-            primary_data["pass"] = self.password
-
             async with self._session.post(
                 f"{self.base_url}/login.html",
-                data=primary_data,
+                data={"user": self.username, "pass": self.password},
                 timeout=aiohttp.ClientTimeout(total=15),
                 allow_redirects=True,
             ) as resp:
-                await resp.text()
-
-            if await self._is_authenticated_session():
-                _LOGGER.info("Login successful to %s (user/pass via /login.html)", self.base_url)
-                return
-
-            # Attempt 2: detected field/action names for firmware variants.
-            fallback_data: Dict[str, str] = dict(hidden_fields)
-            fallback_data[user_field] = self.username
-            fallback_data[pass_field] = self.password
-
-            async with self._session.post(
-                action,
-                data=fallback_data,
-                timeout=aiohttp.ClientTimeout(total=15),
-                allow_redirects=True,
-            ) as resp:
-                await resp.text()
-
-            if await self._is_authenticated_session():
-                _LOGGER.info("Login successful to %s (form-detected fields)", self.base_url)
-                return
-
-            raise PermissionError(
-                f"Invalid username/password for WEM device {self.ip_address}"
-            )
+                await resp.read()
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             _LOGGER.error("Login POST failed: %s (%r)", exc.__class__.__name__, exc)
             raise
 
-    async def _is_authenticated_session(self) -> bool:
-        """Validate that the current session can access a protected page.
-
-        Uses a stack URL when available because /home.html on many WEM
-        firmware versions redirects to /login.html regardless of auth state.
-        Falls back to trusting the session cookie when no stack is configured.
-        """
-        if not self.entries:
-            # No stack to probe – trust that the POST set a valid cookie.
-            # The next actual fetch will re-login if needed.
-            return True
-
-        probe_url = f"{self.base_url}/settings_export.html?stack={self.entries[0]}"
-        try:
-            async with self._session.get(
-                probe_url,
-                timeout=aiohttp.ClientTimeout(total=15),
-                allow_redirects=True,
-            ) as probe_resp:
-                probe_html = await probe_resp.text()
-                probe_soup = BeautifulSoup(probe_html, "lxml")
-                probe_path = urlparse(str(probe_resp.url)).path
-                unauthenticated = (
-                    probe_resp.status in (401, 403)
-                    or probe_path.endswith("/login.html")
-                    or is_login_page(probe_soup)
-                )
-                return not unauthenticated
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            # Network hiccup – assume session is valid, polling will fix it.
-            return True
+        _LOGGER.info("Login POST completed for %s (session cookie accepted)", self.base_url)
 
     # ------------------------------------------------------------------
     # Fetch a stack (with retries for incomplete pages)
