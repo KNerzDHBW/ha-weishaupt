@@ -114,6 +114,9 @@ class WemCoordinator:
         self._current_index: int = 0
         self._running: bool = False
         self._missing_values_retry: Dict[str, set[str]] = {}
+        self._min_read_interval_seconds: int = 5
+        self._last_read_request_ts: Optional[float] = None
+        self._read_rate_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Factory from HA ConfigEntry
@@ -379,6 +382,27 @@ class WemCoordinator:
         await self._check_ip_reachability(timeout_seconds=timeout_seconds)
         await self._check_web_port_reachability(timeout_seconds=timeout_seconds)
 
+    async def _respect_min_read_interval(self, purpose: str = "") -> None:
+        """Enforce a global minimum interval between read requests."""
+        min_interval = max(0, int(self._min_read_interval_seconds))
+        if min_interval <= 0:
+            return
+
+        async with self._read_rate_lock:
+            now = monotonic()
+            if self._last_read_request_ts is not None:
+                elapsed = now - self._last_read_request_ts
+                wait_seconds = min_interval - elapsed
+                if wait_seconds > 0:
+                    _LOGGER.debug(
+                        "Read rate-limit: waiting %.2fs before %s",
+                        wait_seconds,
+                        purpose or "next read request",
+                    )
+                    await asyncio.sleep(wait_seconds)
+                    now = monotonic()
+            self._last_read_request_ts = now
+
     async def _login(self) -> None:
         """Perform form-based login and persist the session cookie.
 
@@ -430,6 +454,7 @@ class WemCoordinator:
 
         for attempt in range(1, self.max_retries + 1):
             try:
+                await self._respect_min_read_interval(f"stack read {stack[:30]}")
                 async with self._session.get(
                     url, timeout=aiohttp.ClientTimeout(total=15)
                 ) as resp:
@@ -501,7 +526,6 @@ class WemCoordinator:
         _LOGGER.info("Discovery: probing %d stack entries", len(self.entries))
         for stack in self.entries:
             await self._discover_stack(stack)
-            await asyncio.sleep(0.5)   # brief pause between requests
         _LOGGER.info("Discovery complete – %d parameter(s) found", len(self._parameters))
 
     async def _discover_stack(self, stack: str) -> bool:
@@ -537,6 +561,7 @@ class WemCoordinator:
         known: set[str] = set(self.entries)
 
         try:
+            await self._respect_min_read_interval("home bootstrap read")
             async with self._session.get(
                 f"{self.base_url}/home.html",
                 timeout=aiohttp.ClientTimeout(total=15),
@@ -720,6 +745,7 @@ class WemCoordinator:
 
         if not queue:
             try:
+                await self._respect_min_read_interval("init-scan home bootstrap read")
                 async with self._session.get(
                     f"{self.base_url}/home.html",
                     timeout=aiohttp.ClientTimeout(total=15),
