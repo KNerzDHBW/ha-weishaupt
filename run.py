@@ -168,15 +168,21 @@ async def main(args: argparse.Namespace) -> None:
 
 async def _on_new_param(stack, params):
     print(f"\n[Discovery]  Stack: {stack[:50]}")
+    print(f"  Found {len(params)} parameter(s):")
     for p in params:
         extra = ""
         if p.param_type == "number":
             extra = f"  range=[{p.min_value}…{p.max_value} step {p.step}]  unit={p.unit}"
         elif p.param_type == "select":
             extra = f"  options={p.options}"
-        elif p.unit:
-            extra = f"  unit={p.unit}"
-        print(f"  [{p.param_type:8s}]  {p.name}  =  {p.current_value}{extra}")
+        elif p.param_type == "readonly":
+            extra = f"  (read-only)  unit={p.unit}" if p.unit else "  (read-only)"
+        else:
+            if p.unit:
+                extra = f"  unit={p.unit}"
+        
+        val_str = str(p.current_value) if p.current_value is not None else "(no value)"
+        print(f"    [{p.param_type:8s}]  {p.name}  =  {val_str}{extra}")
 
 
 # ---------------------------------------------------------------------------
@@ -304,10 +310,27 @@ def _print_all(coordinator: WemCoordinator) -> None:
     if not params:
         print("No parameters discovered yet.")
         return
-    print(f"\n{'Index':<5} {'Type':<9} {'Name':<55} {'Value':<15} {'Unit'}")
-    print("-" * 110)
-    for i, p in enumerate(params):
-        print(f"{i:<5} {p.param_type:<9} {p.name[:54]:<55} {str(p.current_value):<15} {p.unit}")
+    
+    # Group by type for better readability
+    by_type = {}
+    for p in params:
+        if p.param_type not in by_type:
+            by_type[p.param_type] = []
+        by_type[p.param_type].append(p)
+    
+    # Print writable first
+    type_order = ["number", "select", "readonly"]
+    for ptype in type_order:
+        if ptype not in by_type:
+            continue
+        type_params = by_type[ptype]
+        print(f"\n{'Index':<5} {'Type':<9} {'Name':<55} {'Value':<15} {'Unit'}")
+        print("-" * 110)
+        for i, p in enumerate(params):
+            if p.param_type != ptype:
+                continue
+            val_str = str(p.current_value) if p.current_value is not None else "(no value)"
+            print(f"{i:<5} {p.param_type:<9} {p.name[:54]:<55} {val_str:<15} {p.unit}")
 
 
 def _print_entries(coordinator: WemCoordinator) -> None:
@@ -321,8 +344,15 @@ def _print_entries(coordinator: WemCoordinator) -> None:
 
 def _print_stack(coordinator: WemCoordinator, stack: str) -> None:
     params = [p for p in coordinator.get_all_parameters() if p.stack == stack]
+    if not params:
+        print(f"  No parameters for stack {stack}")
+        return
+    print(f"\n  Stack: {stack}")
+    print(f"  Found {len(params)} parameter(s):")
     for p in params:
-        print(f"  {p.name}  =  {p.current_value} {p.unit}")
+        val_str = str(p.current_value) if p.current_value is not None else "(no value)"
+        unit_str = f" {p.unit}" if p.unit else ""
+        print(f"    [{p.param_type:8s}] {p.name}  =  {val_str}{unit_str}")
 
 
 def _resolve_stack(coordinator: WemCoordinator, ref: str) -> Optional[str]:

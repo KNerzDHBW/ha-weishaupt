@@ -112,22 +112,30 @@ def _parse_wem_layout(soup: BeautifulSoup, stack: str) -> Optional[List[ParsedPa
     """Parse the actual WEM dashboard layout used by settings_export.html."""
     content_columns = soup.select("main.col-md-9 > div.container.mx-0 > div.row > div.col-3")
     if not content_columns:
+        _LOGGER.debug("No content columns found in layout for stack %s", stack[:40])
         return None
 
     active_labels = _active_labels(soup)
+    _LOGGER.debug("Active labels for stack %s: %s", stack[:40], active_labels)
     content_column = content_columns[-1]
 
+    # Check for writable form first
     form = content_column.find("form")
     if form and form.find("select"):
         parsed = _parse_wem_writable_form(form, active_labels, stack)
         return [parsed] if parsed else []
 
+    # Check for readonly blocks (div.nav-link.browseobj without nested form)
     readonly_blocks = [
         block for block in content_column.select("div.nav-link.browseobj")
         if not block.find("form")
     ]
+    _LOGGER.debug("Found %d readonly blocks in layout for stack %s", len(readonly_blocks), stack[:40])
+    
     if readonly_blocks:
-        return _parse_wem_readonly_blocks(readonly_blocks, active_labels, stack)
+        result = _parse_wem_readonly_blocks(readonly_blocks, active_labels, stack)
+        _LOGGER.debug("Parsed %d readonly parameters for stack %s", len(result), stack[:40])
+        return result
 
     return []
 
@@ -230,18 +238,42 @@ def _parse_wem_readonly_blocks(blocks: List[Tag], active_labels: List[str], stac
     prefix = active_labels[-1] if active_labels else ""
     seen_ids: set[str] = set()
 
-    for block in blocks:
+    for block_idx, block in enumerate(blocks):
         label_node = block.find("h5")
         if not label_node:
+            _LOGGER.debug("Block %d has no h5 label", block_idx)
             continue
         label = _normalize_text(label_node.get_text(" ", strip=True))
         if not label:
+            _LOGGER.debug("Block %d has empty h5 label", block_idx)
             continue
 
+        # Get all text from the block and extract the value part after the label
         block_text = _normalize_text(block.get_text(" ", strip=True))
-        value_text = block_text[len(label):].strip() if block_text.startswith(label) else block_text.replace(label, "", 1).strip()
+        
+        # The value is everything after the h5 label text
+        # Try to find where the label text ends in the full block text
+        value_text = ""
+        if block_text.startswith(label):
+            # Label is at the start
+            value_text = block_text[len(label):].strip()
+        else:
+            # Label might be in the middle or with extra whitespace
+            # Find the label in the text and take everything after it
+            idx = block_text.find(label)
+            if idx >= 0:
+                value_text = block_text[idx + len(label):].strip()
+        
+        if not value_text:
+            _LOGGER.debug("Block %d (%s) has no value text", block_idx, label)
+            value_text = ""
+        
         value, unit = _split_value_unit(value_text)
         name = f"{prefix}, {label}" if prefix else label
+
+        # If name suggests temperature but no unit was extracted, add °C
+        if not unit and "temperatur" in name.lower():
+            unit = "°C"
 
         param_id = _slugify(name)
         suffix = 1
@@ -250,15 +282,20 @@ def _parse_wem_readonly_blocks(blocks: List[Tag], active_labels: List[str], stac
             suffix += 1
         seen_ids.add(param_id)
 
-        parameters.append(
-            ParsedParameter(
-                param_id=param_id,
-                name=name,
-                current_value=value,
-                param_type="readonly",
-                unit=unit,
-            )
+        param = ParsedParameter(
+            param_id=param_id,
+            name=name,
+            current_value=value,
+            param_type="readonly",
+            unit=unit,
         )
+        
+        _LOGGER.debug(
+            "Block %d: label='%s', value='%s', unit='%s', param_id='%s'",
+            block_idx, label, value, unit, param_id
+        )
+        
+        parameters.append(param)
 
     return parameters
 
