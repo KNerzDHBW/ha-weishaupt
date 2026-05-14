@@ -487,7 +487,7 @@ if __name__ == "__main__":
         help="Recursively scan all menus and print only the discovered entries, one per line",
     )
     parser.add_argument("--interactive", "-i", action="store_true", help="Start interactive REPL")
-    parser.add_argument("--cycle", type=int, default=20, help="Cycle interval in seconds (default 20)")
+    parser.add_argument("--cycle", type=int, default=5, help="Cycle interval in seconds (default 5)")
     parser.add_argument("--retry", type=int, default=5, help="Retry interval in seconds (default 5)")
     parser.add_argument("--retries", type=int, default=3, help="Max retries on incomplete page (default 3)")
     args = parser.parse_args()

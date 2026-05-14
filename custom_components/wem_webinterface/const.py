@@ -14,7 +14,7 @@ CONF_INIT_SCAN_INTERVAL = "init_scan_interval"
 CONF_INIT_SCAN_MAX_ENTRIES = "init_scan_max_entries"
 CONF_REDISCOVER_STACK = "rediscover_stack"
 
-DEFAULT_CYCLE_INTERVAL = 20    # seconds between polls
+DEFAULT_CYCLE_INTERVAL = 5     # seconds between polls
 DEFAULT_RETRY_INTERVAL = 5     # seconds before retry on incomplete page
 DEFAULT_MAX_RETRIES = 3        # max retries for incomplete pages
 DEFAULT_MAX_WRITE_RETRIES = 3  # max retries for write verification

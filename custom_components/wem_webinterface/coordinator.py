@@ -106,6 +106,8 @@ class WemCoordinator:
         self._new_param_callbacks: List[Callable] = []     # called after discovery
         self._status_callbacks: List[Callable] = []
         self._last_successful_read: Optional[datetime] = None
+        self._last_successful_sensor_name: Optional[str] = None
+        self._last_read_error: Optional[str] = None
 
         self._write_event = asyncio.Event()
         self._write_queue: asyncio.Queue = asyncio.Queue()
@@ -117,6 +119,7 @@ class WemCoordinator:
         self._min_read_interval_seconds: int = 5
         self._last_read_request_ts: Optional[float] = None
         self._read_rate_lock = asyncio.Lock()
+        self._consecutive_read_failures: int = 0
 
     # ------------------------------------------------------------------
     # Factory from HA ConfigEntry
@@ -161,6 +164,18 @@ class WemCoordinator:
     def last_successful_read(self) -> Optional[datetime]:
         return self._last_successful_read
 
+    @property
+    def last_successful_sensor_name(self) -> Optional[str]:
+        return self._last_successful_sensor_name
+
+    @property
+    def consecutive_read_failures(self) -> int:
+        return self._consecutive_read_failures
+
+    @property
+    def last_read_error(self) -> Optional[str]:
+        return self._last_read_error
+
     @staticmethod
     def _has_usable_value(value: Any) -> bool:
         """Return True if a parsed value should replace the current entity state."""
@@ -199,9 +214,8 @@ class WemCoordinator:
         except ValueError:
             pass
 
-    async def _mark_successful_read(self, when: Optional[datetime] = None) -> None:
-        """Track the last time any parameter was read successfully."""
-        self._last_successful_read = when or datetime.now()
+    async def _notify_status_callbacks(self) -> None:
+        """Notify diagnostic listeners about coordinator-level state changes."""
         for cb in list(self._status_callbacks):
             try:
                 if asyncio.iscoroutinefunction(cb):
@@ -210,6 +224,19 @@ class WemCoordinator:
                     cb()
             except Exception as exc:
                 _LOGGER.error("Error in status callback: %s", exc)
+
+    async def _mark_successful_read(
+        self,
+        when: Optional[datetime] = None,
+        sensor_name: Optional[str] = None,
+    ) -> None:
+        """Track the last time any parameter was read successfully."""
+        self._last_successful_read = when or datetime.now()
+        if sensor_name:
+            self._last_successful_sensor_name = sensor_name
+        self._consecutive_read_failures = 0
+        self._last_read_error = None
+        await self._notify_status_callbacks()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -289,8 +316,42 @@ class WemCoordinator:
         if self._session and not self._session.closed:
             await self._session.close()
         connector = aiohttp.TCPConnector(ssl=False)
-        jar = aiohttp.CookieJar(unsafe=True)
-        self._session = aiohttp.ClientSession(connector=connector, cookie_jar=jar)
+        jar = aiohttp.CookieJar(unsafe=True, quote_cookie=False)
+        self._session = aiohttp.ClientSession(
+            connector=connector,
+            cookie_jar=jar,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) WEM-HA/1.0",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+
+    async def _verify_authenticated_session(self) -> bool:
+        """Return True if the current session can access protected pages."""
+        probe_urls: List[str] = []
+        if self.entries:
+            probe_urls.append(f"{self.base_url}/settings_export.html?stack={self.entries[0]}")
+        probe_urls.append(f"{self.base_url}/settings_export.html")
+        probe_urls.append(f"{self.base_url}/home.html")
+
+        for url in probe_urls:
+            try:
+                await self._respect_min_read_interval("login verification probe")
+                async with self._session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    allow_redirects=True,
+                ) as resp:
+                    html = await resp.text()
+                    if resp.status != 200:
+                        continue
+                    soup = BeautifulSoup(html, "lxml")
+                    if not is_login_page(soup):
+                        return True
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                continue
+
+        return False
 
     async def _check_ip_reachability(self, timeout_seconds: int = 5) -> None:
         """Check whether the configured host is reachable before port checks.
@@ -403,6 +464,28 @@ class WemCoordinator:
                     now = monotonic()
             self._last_read_request_ts = now
 
+    async def _handle_failed_read_attempt(self, reason: str, stack: str = "") -> None:
+        """Track failed reads and trigger re-login every 5th consecutive failure."""
+        self._consecutive_read_failures += 1
+        failures = self._consecutive_read_failures
+        self._last_read_error = f"{reason} ({stack[:40]})" if stack else reason
+        if failures % 5 == 0:
+            _LOGGER.warning(
+                "Read failed %d times consecutively (%s); forcing re-login",
+                failures,
+                reason,
+            )
+            try:
+                await self._login()
+            except Exception as exc:
+                self._last_read_error = f"forced-relogin-failed: {exc}"
+                _LOGGER.error("Forced re-login failed after read failures: %s", exc)
+        await self._notify_status_callbacks()
+
+    def _handle_successful_read_attempt(self) -> None:
+        """Reset failure counter after any successful read attempt."""
+        self._consecutive_read_failures = 0
+
     async def _login(self) -> None:
         """Perform form-based login and persist the session cookie.
 
@@ -436,13 +519,23 @@ class WemCoordinator:
                 data={"user": self.username, "pass": self.password},
                 timeout=aiohttp.ClientTimeout(total=15),
                 allow_redirects=True,
+                headers={
+                    "Referer": f"{self.base_url}/login.html",
+                    "Origin": self.base_url,
+                },
             ) as resp:
                 await resp.read()
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             _LOGGER.error("Login POST failed: %s (%r)", exc.__class__.__name__, exc)
             raise
 
-        _LOGGER.info("Login POST completed for %s (session cookie accepted)", self.base_url)
+        authenticated = await self._verify_authenticated_session()
+        if not authenticated:
+            raise PermissionError(
+                f"Login failed for {self.base_url}: still receiving login page after POST."
+            )
+
+        _LOGGER.info("Login completed for %s (authenticated session verified)", self.base_url)
 
     # ------------------------------------------------------------------
     # Fetch a stack (with retries for incomplete pages)
@@ -459,8 +552,8 @@ class WemCoordinator:
                     url, timeout=aiohttp.ClientTimeout(total=15)
                 ) as resp:
                     if resp.status == 401:
-                        _LOGGER.info("Session expired, re-logging in")
-                        await self._login()
+                        _LOGGER.info("Session expired while reading stack %s", stack[:30])
+                        await self._handle_failed_read_attempt("http-401", stack)
                         continue
 
                     if resp.status != 200:
@@ -474,14 +567,15 @@ class WemCoordinator:
                         soup = BeautifulSoup(html, "lxml")
                         if is_login_page(soup):
                             _LOGGER.info(
-                                "Stack %s returned the login page, retrying after re-login",
+                                "Stack %s returned the login page",
                                 stack[:30],
                             )
-                            await self._login()
+                            await self._handle_failed_read_attempt("login-page", stack)
                             continue
 
                         parsed = parse_settings_page(html, stack)
                         if parsed is not None:
+                            self._handle_successful_read_attempt()
                             return html
 
                         html_preview = html[:240].replace("\n", " ").replace("\r", " ")
@@ -489,15 +583,17 @@ class WemCoordinator:
                             "Stack %s: page could not be parsed (attempt %d/%d), retrying in %ds, preview=%s",
                             stack[:30], attempt, self.max_retries, self.retry_interval, html_preview,
                         )
+                        await self._handle_failed_read_attempt("unparseable-page", stack)
 
             except asyncio.TimeoutError:
                 _LOGGER.warning(
                     "Timeout on stack %s (attempt %d/%d)", stack[:30], attempt, self.max_retries
                 )
+                await self._handle_failed_read_attempt("timeout", stack)
             except aiohttp.ClientError as exc:
                 _LOGGER.error("HTTP error on stack %s: %s", stack[:30], exc)
                 try:
-                    await self._login()
+                    await self._handle_failed_read_attempt("http-client-error", stack)
                 except Exception:
                     pass
 
@@ -921,6 +1017,7 @@ class WemCoordinator:
         failure_key = self.make_key(stack, "discovery_failed")
         self._parameters.pop(failure_key, None)
         saw_usable_value = False
+        last_usable_name: Optional[str] = None
 
         for p in params:
             key = self.make_key(stack, p.param_id)
@@ -946,9 +1043,10 @@ class WemCoordinator:
             )
             if self._has_usable_value(p.current_value):
                 saw_usable_value = True
+                last_usable_name = p.name
 
         if saw_usable_value:
-            await self._mark_successful_read()
+            await self._mark_successful_read(sensor_name=last_usable_name)
 
         # Notify HA platforms (or standalone consumers) about new parameters
         for cb in self._new_param_callbacks:
@@ -1128,7 +1226,7 @@ class WemCoordinator:
                 usable_param_ids.add(p.param_id)
                 info.current_value = p.current_value
                 info.last_updated = datetime.now()
-                await self._mark_successful_read(info.last_updated)
+                await self._mark_successful_read(info.last_updated, info.name)
 
                 if old_val != p.current_value:
                     _LOGGER.debug(
@@ -1281,7 +1379,7 @@ class WemCoordinator:
                         _LOGGER.info("Write verified: %s = %s", info.name, p.current_value)
                         info.current_value = p.current_value
                         info.last_updated = datetime.now()
-                        await self._mark_successful_read(info.last_updated)
+                        await self._mark_successful_read(info.last_updated, info.name)
                         await self._fire_callbacks(key)
                         verified = True
                     else:
