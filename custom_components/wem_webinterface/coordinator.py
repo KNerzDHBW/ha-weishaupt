@@ -104,6 +104,8 @@ class WemCoordinator:
         self._parameters: Dict[str, ParameterInfo] = {}   # key → ParameterInfo
         self._callbacks: Dict[str, List[Callable]] = {}    # key → [callback, ...]
         self._new_param_callbacks: List[Callable] = []     # called after discovery
+        self._status_callbacks: List[Callable] = []
+        self._last_successful_read: Optional[datetime] = None
 
         self._write_event = asyncio.Event()
         self._write_queue: asyncio.Queue = asyncio.Queue()
@@ -152,6 +154,10 @@ class WemCoordinator:
     def get_all_parameters(self) -> List[ParameterInfo]:
         return list(self._parameters.values())
 
+    @property
+    def last_successful_read(self) -> Optional[datetime]:
+        return self._last_successful_read
+
     @staticmethod
     def _has_usable_value(value: Any) -> bool:
         """Return True if a parsed value should replace the current entity state."""
@@ -179,6 +185,28 @@ class WemCoordinator:
     def register_new_param_callback(self, cb: Callable) -> None:
         """Register a callback invoked with (stack, List[ParsedParameter]) after discovery."""
         self._new_param_callbacks.append(cb)
+
+    def register_status_callback(self, cb: Callable) -> None:
+        """Register a callback invoked when coordinator-level diagnostics change."""
+        self._status_callbacks.append(cb)
+
+    def unregister_status_callback(self, cb: Callable) -> None:
+        try:
+            self._status_callbacks.remove(cb)
+        except ValueError:
+            pass
+
+    async def _mark_successful_read(self, when: Optional[datetime] = None) -> None:
+        """Track the last time any parameter was read successfully."""
+        self._last_successful_read = when or datetime.now()
+        for cb in list(self._status_callbacks):
+            try:
+                if asyncio.iscoroutinefunction(cb):
+                    await cb()
+                else:
+                    cb()
+            except Exception as exc:
+                _LOGGER.error("Error in status callback: %s", exc)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -559,7 +587,22 @@ class WemCoordinator:
     async def async_rediscover_stack(self, stack: str) -> None:
         """Public API: re-run discovery for one stack (e.g. service call)."""
         _LOGGER.info("Re-discovering stack: %s", stack[:40])
-        await self._discover_stack(stack)
+        added_entry = False
+        if stack not in self.entries:
+            self.entries.append(stack)
+            added_entry = True
+
+        success = await self._discover_stack(stack)
+        if success and self.hass is not None and self.config_entry is not None:
+            self.hass.config_entries.async_update_entry(
+                self.config_entry,
+                options={
+                    **self.config_entry.options,
+                    CONF_ENTRIES: "\n".join(self.entries),
+                },
+            )
+        elif not success and added_entry:
+            self.entries.remove(stack)
 
     def _start_selected_rediscover_retry(self) -> None:
         """Start background rediscovery loop for the selected stack from options."""
@@ -851,6 +894,7 @@ class WemCoordinator:
         # Remove stale failure marker once discovery succeeds again.
         failure_key = self.make_key(stack, "discovery_failed")
         self._parameters.pop(failure_key, None)
+        saw_usable_value = False
 
         for p in params:
             key = self.make_key(stack, p.param_id)
@@ -874,6 +918,11 @@ class WemCoordinator:
                 "Discovered  %-50s  [%s]  value=%s  %s",
                 p.name, p.param_type, p.current_value, p.unit,
             )
+            if self._has_usable_value(p.current_value):
+                saw_usable_value = True
+
+        if saw_usable_value:
+            await self._mark_successful_read()
 
         # Notify HA platforms (or standalone consumers) about new parameters
         for cb in self._new_param_callbacks:
@@ -1053,6 +1102,7 @@ class WemCoordinator:
                 usable_param_ids.add(p.param_id)
                 info.current_value = p.current_value
                 info.last_updated = datetime.now()
+                await self._mark_successful_read(info.last_updated)
 
                 if old_val != p.current_value:
                     _LOGGER.debug(
@@ -1205,6 +1255,7 @@ class WemCoordinator:
                         _LOGGER.info("Write verified: %s = %s", info.name, p.current_value)
                         info.current_value = p.current_value
                         info.last_updated = datetime.now()
+                        await self._mark_successful_read(info.last_updated)
                         await self._fire_callbacks(key)
                         verified = True
                     else:

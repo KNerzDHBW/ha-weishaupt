@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from homeassistant.components.text import TextEntity
 from homeassistant.config_entries import ConfigEntry
@@ -43,7 +42,7 @@ class WemAddStackText(TextEntity):
     @property
     def available(self) -> bool:
         """Return True if coordinator is ready."""
-        return not self.coordinator.discovery_failed
+        return True
 
     async def async_set_value(self, value: str) -> None:
         """Handle text value change."""

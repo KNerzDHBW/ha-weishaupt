@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
@@ -13,7 +12,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import WemCoordinator
-from .entity_base import WemEntity
+from .entity_base import WemBaseEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,6 +24,12 @@ async def async_setup_entry(
 ) -> None:
     """Set up button entities."""
     coordinator: WemCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+    buttons = []
+    for param in coordinator.get_all_parameters():
+        buttons.append(WemParameterRefreshButton(coordinator, param.stack, param.param_id))
+        buttons.append(WemParameterRediscoverButton(coordinator, param.stack, param.param_id))
+    if buttons:
+        async_add_entities(buttons)
     
     # Register callback to add buttons when new parameters are discovered
     def _on_new_params(stack: str, params: list) -> None:
@@ -40,7 +45,7 @@ async def async_setup_entry(
     coordinator.register_new_param_callback(_on_new_params)
 
 
-class WemParameterRefreshButton(WemEntity, ButtonEntity):
+class WemParameterRefreshButton(WemBaseEntity, ButtonEntity):
     """Button to refresh a single parameter value."""
 
     entity_category = EntityCategory.CONFIG
@@ -71,11 +76,10 @@ class WemParameterRefreshButton(WemEntity, ButtonEntity):
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        info = self.coordinator.get_parameter(self._stack, self._param_id)
-        return info is not None and not self.coordinator.discovery_failed
+        return super().available
 
 
-class WemParameterRediscoverButton(WemEntity, ButtonEntity):
+class WemParameterRediscoverButton(WemBaseEntity, ButtonEntity):
     """Button to re-discover a single parameter (refresh metadata, range, type, etc.)."""
 
     entity_category = EntityCategory.CONFIG
@@ -106,5 +110,4 @@ class WemParameterRediscoverButton(WemEntity, ButtonEntity):
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        info = self.coordinator.get_parameter(self._stack, self._param_id)
-        return info is not None and not self.coordinator.discovery_failed
+        return super().available
