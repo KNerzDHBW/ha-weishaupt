@@ -259,24 +259,24 @@ class WemCoordinator:
         )
         return self._cache_store
 
-    async def _load_cached_parameters(self) -> None:
+    async def _load_cached_parameters(self) -> int:
         """Load parameter metadata and last known states from persistent HA storage."""
         store = self._get_cache_store()
         if store is None:
-            return
+            return 0
 
         try:
             data = await store.async_load()
         except Exception as exc:
             _LOGGER.warning("Failed to load parameter cache: %s", exc)
-            return
+            return 0
 
         if not isinstance(data, dict):
-            return
+            return 0
 
         raw_params = data.get("parameters")
         if not isinstance(raw_params, list):
-            return
+            return 0
 
         loaded = 0
         for raw in raw_params:
@@ -334,6 +334,8 @@ class WemCoordinator:
 
         if loaded:
             _LOGGER.info("Loaded %d parameter(s) from persistent cache", loaded)
+
+        return loaded
 
     async def _save_cached_parameters(self) -> None:
         """Persist discovered parameter metadata and last known values."""
@@ -444,7 +446,7 @@ class WemCoordinator:
             self.max_retries,
         )
         await self._await_result(self._create_session())
-        await self._load_cached_parameters()
+        loaded_cached_params = await self._load_cached_parameters()
         try:
             await self._await_result(self._check_ip_reachability())
             _LOGGER.info("Reachability check (DNS/ping) passed for host=%s", self.ip_address)
@@ -470,7 +472,13 @@ class WemCoordinator:
                     len(self.entries),
                 )
 
-            await self._await_result(self._discover_all())
+            if loaded_cached_params == 0:
+                await self._await_result(self._discover_all())
+            else:
+                _LOGGER.info(
+                    "Skipping startup discovery because %d cached parameter(s) were loaded; new values will be read in the normal polling cycle",
+                    loaded_cached_params,
+                )
             self._running = True
             self._poll_task = asyncio.ensure_future(self._polling_loop())
             self._start_selected_rediscover_retry()
