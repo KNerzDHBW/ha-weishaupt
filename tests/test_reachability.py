@@ -17,14 +17,11 @@ class TestReachabilityChecks(unittest.IsolatedAsyncioTestCase):
 
         call_order = []
 
-        async def record(name):
-            call_order.append(name)
-
-        coordinator._create_session = AsyncMock(side_effect=lambda: record("session"))
-        coordinator._check_ip_reachability = AsyncMock(side_effect=lambda timeout_seconds=5: record("ip"))
-        coordinator._check_web_port_reachability = AsyncMock(side_effect=lambda timeout_seconds=5: record("port80"))
-        coordinator._login = AsyncMock(side_effect=lambda: record("login"))
-        coordinator._discover_all = AsyncMock(side_effect=lambda: record("discover"))
+        coordinator._create_session = AsyncMock(side_effect=lambda: call_order.append("session"))
+        coordinator._check_ip_reachability = AsyncMock(side_effect=lambda timeout_seconds=5: call_order.append("ip"))
+        coordinator._check_web_port_reachability = AsyncMock(side_effect=lambda timeout_seconds=5: call_order.append("port80"))
+        coordinator._login = AsyncMock(side_effect=lambda: call_order.append("login"))
+        coordinator._discover_all = AsyncMock(side_effect=lambda: call_order.append("discover"))
         coordinator._polling_loop = AsyncMock()
 
         await coordinator.async_setup()

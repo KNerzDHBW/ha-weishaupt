@@ -12,6 +12,7 @@ Handles:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import ipaddress
 import logging
 import platform
@@ -28,6 +29,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 from .const import (
+    DOMAIN,
     CONF_CYCLE_INTERVAL,
     CONF_IP_ADDRESS,
     CONF_MAX_RETRIES,
@@ -67,7 +69,9 @@ class ParameterInfo:
     write_action: Optional[str] = None     # relative POST endpoint (e.g. pro_save.html)
     write_fields: Optional[Dict[str, str]] = None  # hidden form fields for writes
     current_value: Any = None
+    last_real_value: Any = None
     last_updated: Optional[datetime] = None
+    has_successful_read: bool = False
     discovery_failed: bool = False
 
 
@@ -120,6 +124,7 @@ class WemCoordinator:
         self._last_read_request_ts: Optional[float] = None
         self._read_rate_lock = asyncio.Lock()
         self._consecutive_read_failures: int = 0
+        self._cache_store = None
 
     # ------------------------------------------------------------------
     # Factory from HA ConfigEntry
@@ -184,6 +189,191 @@ class WemCoordinator:
         if isinstance(value, str) and not value.strip():
             return False
         return True
+
+    @staticmethod
+    async def _await_result(value: Any) -> Any:
+        """Await one nested awaitable if a mocked async method returns a coroutine."""
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    @staticmethod
+    def _number_supports_default_minus_200(info: ParameterInfo) -> bool:
+        """Return True if -200 is within the configured HA number limits."""
+        if info.min_value is not None and -200 < info.min_value:
+            return False
+        if info.max_value is not None and -200 > info.max_value:
+            return False
+        return True
+
+    def _initial_default_value(self, info: ParameterInfo) -> Any:
+        """Build a startup-only placeholder value for known parameters."""
+        if info.param_type == "number":
+            if self._number_supports_default_minus_200(info):
+                return -200.0
+            if self._has_usable_value(info.last_real_value):
+                return info.last_real_value
+            if info.min_value is not None:
+                return info.min_value
+            return 0.0
+
+        if info.param_type == "select":
+            options = list(info.options or [])
+            if "" in options:
+                return ""
+            if self._has_usable_value(info.last_real_value):
+                return str(info.last_real_value)
+            if options:
+                return options[0]
+            return ""
+
+        # Read-only/text-like states can be shown empty in HA until first poll update.
+        return ""
+
+    def _stack_is_fully_known(self, stack: str) -> bool:
+        """Return True when every known parameter in stack has been read successfully before."""
+        infos = [
+            info
+            for info in self._parameters.values()
+            if info.stack == stack and not info.discovery_failed
+        ]
+        return bool(infos) and all(info.has_successful_read for info in infos)
+
+    def _get_cache_store(self):
+        """Return HA storage backend used for persistent parameter metadata cache."""
+        if self.hass is None or self.config_entry is None or not hasattr(self.hass, "config"):
+            return None
+
+        if self._cache_store is not None:
+            return self._cache_store
+
+        try:
+            from homeassistant.helpers.storage import Store
+        except Exception:
+            return None
+
+        self._cache_store = Store(
+            self.hass,
+            1,
+            f"{DOMAIN}_{self.config_entry.entry_id}_parameter_cache",
+        )
+        return self._cache_store
+
+    async def _load_cached_parameters(self) -> None:
+        """Load parameter metadata and last known states from persistent HA storage."""
+        store = self._get_cache_store()
+        if store is None:
+            return
+
+        try:
+            data = await store.async_load()
+        except Exception as exc:
+            _LOGGER.warning("Failed to load parameter cache: %s", exc)
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        raw_params = data.get("parameters")
+        if not isinstance(raw_params, list):
+            return
+
+        loaded = 0
+        for raw in raw_params:
+            if not isinstance(raw, dict):
+                continue
+
+            stack = str(raw.get("stack") or "")
+            param_id = str(raw.get("param_id") or "")
+            if not stack or not param_id:
+                continue
+
+            cached_value = raw.get("current_value")
+            last_real_value = raw.get("last_real_value", cached_value)
+            has_successful_read = raw.get("has_successful_read")
+            if has_successful_read is None:
+                has_successful_read = self._has_usable_value(last_real_value)
+
+            last_updated = None
+            raw_last_updated = raw.get("last_updated")
+            if isinstance(raw_last_updated, str) and raw_last_updated:
+                try:
+                    last_updated = datetime.fromisoformat(raw_last_updated)
+                except ValueError:
+                    last_updated = None
+
+            info = ParameterInfo(
+                stack=stack,
+                param_id=param_id,
+                name=str(raw.get("name") or param_id),
+                param_type=str(raw.get("param_type") or "readonly"),
+                unit=str(raw.get("unit") or ""),
+                min_value=raw.get("min_value"),
+                max_value=raw.get("max_value"),
+                step=raw.get("step"),
+                options=list(raw.get("options") or []),
+                form_field_name=raw.get("form_field_name"),
+                write_action=raw.get("write_action"),
+                write_fields=dict(raw.get("write_fields") or {}),
+                current_value=None,
+                last_real_value=last_real_value,
+                last_updated=last_updated,
+                has_successful_read=bool(has_successful_read),
+                discovery_failed=False,
+            )
+
+            if info.has_successful_read:
+                info.current_value = self._initial_default_value(info)
+            else:
+                info.current_value = cached_value
+
+            key = self.make_key(stack, param_id)
+            self._parameters[key] = info
+            loaded += 1
+
+        if loaded:
+            _LOGGER.info("Loaded %d parameter(s) from persistent cache", loaded)
+
+    async def _save_cached_parameters(self) -> None:
+        """Persist discovered parameter metadata and last known values."""
+        store = self._get_cache_store()
+        if store is None:
+            return
+
+        payload: list[dict[str, Any]] = []
+        for info in self._parameters.values():
+            if info.discovery_failed:
+                continue
+
+            last_real_value = info.last_real_value
+            if not self._has_usable_value(last_real_value) and self._has_usable_value(info.current_value):
+                last_real_value = info.current_value
+
+            payload.append(
+                {
+                    "stack": info.stack,
+                    "param_id": info.param_id,
+                    "name": info.name,
+                    "param_type": info.param_type,
+                    "unit": info.unit,
+                    "min_value": info.min_value,
+                    "max_value": info.max_value,
+                    "step": info.step,
+                    "options": list(info.options or []),
+                    "form_field_name": info.form_field_name,
+                    "write_action": info.write_action,
+                    "write_fields": dict(info.write_fields or {}),
+                    "current_value": info.current_value,
+                    "last_real_value": last_real_value,
+                    "last_updated": info.last_updated.isoformat() if info.last_updated else None,
+                    "has_successful_read": bool(info.has_successful_read),
+                }
+            )
+
+        try:
+            await store.async_save({"parameters": payload})
+        except Exception as exc:
+            _LOGGER.warning("Failed to save parameter cache: %s", exc)
 
     # ------------------------------------------------------------------
     # Callback registration (used by HA entities)
@@ -252,13 +442,14 @@ class WemCoordinator:
             self.retry_interval,
             self.max_retries,
         )
-        await self._create_session()
+        await self._await_result(self._create_session())
+        await self._load_cached_parameters()
         try:
-            await self._check_ip_reachability()
+            await self._await_result(self._check_ip_reachability())
             _LOGGER.info("Reachability check (DNS/ping) passed for host=%s", self.ip_address)
-            await self._check_web_port_reachability()
+            await self._await_result(self._check_web_port_reachability())
             _LOGGER.info("Port 80 check passed for host=%s", self.ip_address)
-            await self._login()
+            await self._await_result(self._login())
             _LOGGER.info("Login completed for host=%s", self.ip_address)
 
             if not self.entries:
@@ -278,7 +469,7 @@ class WemCoordinator:
                     len(self.entries),
                 )
 
-            await self._discover_all()
+            await self._await_result(self._discover_all())
             self._running = True
             self._poll_task = asyncio.ensure_future(self._polling_loop())
             self._start_selected_rediscover_retry()
@@ -305,6 +496,7 @@ class WemCoordinator:
                 await self._rediscover_retry_task
             except asyncio.CancelledError:
                 pass
+        await self._save_cached_parameters()
         if self._session and not self._session.closed:
             await self._session.close()
 
@@ -621,6 +813,12 @@ class WemCoordinator:
     async def _discover_all(self) -> None:
         _LOGGER.info("Discovery: probing %d stack entries", len(self.entries))
         for stack in self.entries:
+            if self._stack_is_fully_known(stack):
+                _LOGGER.info(
+                    "Discovery: skipping startup read for stack %s (all values known from cache)",
+                    stack[:40],
+                )
+                continue
             await self._discover_stack(stack)
         _LOGGER.info("Discovery complete – %d parameter(s) found", len(self._parameters))
 
@@ -1018,25 +1216,70 @@ class WemCoordinator:
         self._parameters.pop(failure_key, None)
         saw_usable_value = False
         last_usable_name: Optional[str] = None
+        persist_cache = False
 
         for p in params:
             key = self.make_key(stack, p.param_id)
-            self._parameters[key] = ParameterInfo(
-                stack=stack,
-                param_id=p.param_id,
-                name=p.name,
-                param_type=p.param_type,
-                unit=p.unit,
-                min_value=p.min_value,
-                max_value=p.max_value,
-                step=p.step,
-                options=p.options,
-                form_field_name=p.form_field_name,
-                write_action=p.write_action,
-                write_fields=p.write_fields,
-                current_value=p.current_value,
-                last_updated=datetime.now(),
-            )
+            info = self._parameters.get(key)
+            if info is None:
+                info = ParameterInfo(
+                    stack=stack,
+                    param_id=p.param_id,
+                    name=p.name,
+                    param_type=p.param_type,
+                    unit=p.unit,
+                    min_value=p.min_value,
+                    max_value=p.max_value,
+                    step=p.step,
+                    options=p.options,
+                    form_field_name=p.form_field_name,
+                    write_action=p.write_action,
+                    write_fields=p.write_fields,
+                )
+                self._parameters[key] = info
+                persist_cache = True
+            else:
+                if info.name != p.name:
+                    info.name = p.name
+                    persist_cache = True
+                if info.param_type != p.param_type:
+                    info.param_type = p.param_type
+                    persist_cache = True
+                if info.unit != p.unit:
+                    info.unit = p.unit
+                    persist_cache = True
+                if info.min_value != p.min_value:
+                    info.min_value = p.min_value
+                    persist_cache = True
+                if info.max_value != p.max_value:
+                    info.max_value = p.max_value
+                    persist_cache = True
+                if info.step != p.step:
+                    info.step = p.step
+                    persist_cache = True
+                if info.options != p.options:
+                    info.options = p.options
+                    persist_cache = True
+                if info.form_field_name != p.form_field_name:
+                    info.form_field_name = p.form_field_name
+                    persist_cache = True
+                if info.write_action != p.write_action:
+                    info.write_action = p.write_action
+                    persist_cache = True
+                if info.write_fields != p.write_fields:
+                    info.write_fields = p.write_fields
+                    persist_cache = True
+
+            if self._has_usable_value(p.current_value):
+                info.current_value = p.current_value
+                info.last_real_value = p.current_value
+                info.last_updated = datetime.now()
+                if not info.has_successful_read:
+                    info.has_successful_read = True
+                    persist_cache = True
+            elif info.current_value is None:
+                info.current_value = self._initial_default_value(info)
+
             _LOGGER.info(
                 "Discovered  %-50s  [%s]  value=%s  %s",
                 p.name, p.param_type, p.current_value, p.unit,
@@ -1047,6 +1290,9 @@ class WemCoordinator:
 
         if saw_usable_value:
             await self._mark_successful_read(sensor_name=last_usable_name)
+
+        if persist_cache:
+            await self._save_cached_parameters()
 
         # Notify HA platforms (or standalone consumers) about new parameters
         for cb in self._new_param_callbacks:
@@ -1192,6 +1438,7 @@ class WemCoordinator:
             seen_param_ids.add(p.param_id)
             key = self.make_key(stack, p.param_id)
             info = self._parameters.get(key)
+            metadata_changed = False
             if info is None:
                 # Newly appeared parameter – add it
                 info = ParameterInfo(
@@ -1209,23 +1456,48 @@ class WemCoordinator:
                     write_fields=p.write_fields,
                 )
                 self._parameters[key] = info
+                metadata_changed = True
             else:
                 # Update metadata for existing parameter (enables correction of scaled values)
+                if info.unit != p.unit:
+                    metadata_changed = True
                 info.unit = p.unit
+                if info.min_value != p.min_value:
+                    metadata_changed = True
                 info.min_value = p.min_value
+                if info.max_value != p.max_value:
+                    metadata_changed = True
                 info.max_value = p.max_value
+                if info.step != p.step:
+                    metadata_changed = True
                 info.step = p.step
+                if info.options != p.options:
+                    metadata_changed = True
                 info.options = p.options
+                if info.form_field_name != p.form_field_name:
+                    metadata_changed = True
                 info.form_field_name = p.form_field_name
 
+            if info.write_action != p.write_action:
+                metadata_changed = True
+            if info.write_fields != p.write_fields:
+                metadata_changed = True
             info.write_action = p.write_action
             info.write_fields = p.write_fields
+
+            persist_cache = False
+            if metadata_changed:
+                persist_cache = True
 
             old_val = info.current_value
             if self._has_usable_value(p.current_value):
                 usable_param_ids.add(p.param_id)
                 info.current_value = p.current_value
+                info.last_real_value = p.current_value
                 info.last_updated = datetime.now()
+                if not info.has_successful_read:
+                    info.has_successful_read = True
+                    persist_cache = True
                 await self._mark_successful_read(info.last_updated, info.name)
 
                 if old_val != p.current_value:
@@ -1234,12 +1506,17 @@ class WemCoordinator:
                     )
                     await self._fire_callbacks(key)
             else:
+                if old_val is None:
+                    info.current_value = self._initial_default_value(info)
                 _LOGGER.debug(
                     "Ignoring unusable value for %s on stack %s; keeping last known value=%s",
                     p.name,
                     stack[:40],
                     old_val,
                 )
+
+            if persist_cache:
+                await self._save_cached_parameters()
 
         if track_missing and known_param_ids:
             missing = known_param_ids - usable_param_ids
