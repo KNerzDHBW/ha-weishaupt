@@ -322,10 +322,11 @@ class WemCoordinator:
                 discovery_failed=False,
             )
 
-            if info.has_successful_read:
-                info.current_value = self._initial_default_value(info)
-            else:
+            info.current_value = self._initial_default_value(info)
+            if not self._has_usable_value(info.current_value):
                 info.current_value = cached_value
+            if not self._has_usable_value(info.current_value):
+                info.current_value = self._initial_default_value(info)
 
             key = self.make_key(stack, param_id)
             self._parameters[key] = info
