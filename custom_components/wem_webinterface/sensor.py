@@ -35,6 +35,7 @@ async def async_setup_entry(
     entities.append(WemLastSuccessfulSensorNameSensor(coordinator))
     entities.append(WemConsecutiveReadFailuresSensor(coordinator))
     entities.append(WemLastReadErrorSensor(coordinator))
+    entities.append(WemStatusSensor(coordinator))
     async_add_entities(entities)
 
     # Also handle parameters discovered later (re-discovery)
@@ -226,3 +227,41 @@ class WemLastReadErrorSensor(SensorEntity):
     @property
     def native_value(self) -> Optional[str]:
         return self._coordinator.last_read_error
+
+
+class WemStatusSensor(SensorEntity):
+    """Diagnostic sensor exposing the coordinator runtime status."""
+
+    _attr_should_poll = False
+    _attr_has_entity_name = True
+    _attr_name = "Status"
+    _attr_icon = "mdi:state-machine"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: WemCoordinator) -> None:
+        self._coordinator = coordinator
+        self._attr_unique_id = f"wem_{coordinator.ip_address}_status"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, coordinator.ip_address)},
+            "name": f"WEM {coordinator.ip_address}",
+            "manufacturer": "WEM",
+            "model": "Web Interface",
+            "configuration_url": coordinator.base_url,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        self._coordinator.register_status_callback(self._handle_update)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._coordinator.unregister_status_callback(self._handle_update)
+
+    def _handle_update(self) -> None:
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    @property
+    def native_value(self) -> str:
+        return self._coordinator.status_value

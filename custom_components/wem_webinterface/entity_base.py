@@ -56,4 +56,8 @@ class WemBaseEntity(Entity):
     @property
     def available(self) -> bool:
         info = self._coordinator.get_parameter(self._stack, self._param_id)
-        return info is not None and not info.discovery_failed
+        return (
+            info is not None
+            and not info.discovery_failed
+            and getattr(info, "is_available", True)
+        )

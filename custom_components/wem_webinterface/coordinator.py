@@ -48,6 +48,13 @@ from .parser import ParsedParameter, is_login_page, parse_settings_page
 
 _LOGGER = logging.getLogger(__name__)
 
+STATUS_LOGIN_FAILED = "Login failed"
+STATUS_LOGIN_SUCCESSFUL = "Login successful"
+STATUS_UPDATING = "Updaten"
+STATUS_FAILED_ONCE = "Failed once"
+STATUS_FAILED_TWICE = "Failed twice"
+STATUS_FAILED = "Failed"
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -72,6 +79,7 @@ class ParameterInfo:
     last_real_value: Any = None
     last_updated: Optional[datetime] = None
     has_successful_read: bool = False
+    is_available: bool = True
     discovery_failed: bool = False
 
 
@@ -125,6 +133,9 @@ class WemCoordinator:
         self._read_rate_lock = asyncio.Lock()
         self._consecutive_read_failures: int = 0
         self._cache_store = None
+        self._status_value: str = STATUS_UPDATING
+        self._login_failed_latched: bool = False
+        self._cycle_failure_count: int = 0
 
     # ------------------------------------------------------------------
     # Factory from HA ConfigEntry
@@ -180,6 +191,10 @@ class WemCoordinator:
     @property
     def last_read_error(self) -> Optional[str]:
         return self._last_read_error
+
+    @property
+    def status_value(self) -> str:
+        return self._status_value
 
     @staticmethod
     def _has_usable_value(value: Any) -> bool:
@@ -319,6 +334,7 @@ class WemCoordinator:
                 last_real_value=last_real_value,
                 last_updated=last_updated,
                 has_successful_read=bool(has_successful_read),
+                is_available=True,
                 discovery_failed=False,
             )
 
@@ -418,6 +434,40 @@ class WemCoordinator:
             except Exception as exc:
                 _LOGGER.error("Error in status callback: %s", exc)
 
+    async def _set_status(self, status: str) -> None:
+        """Update runtime status and notify listeners when the value changes."""
+        if self._status_value == status:
+            return
+        self._status_value = status
+        await self._notify_status_callbacks()
+
+    async def _set_login_failed_status(self) -> None:
+        """Latch login-failed mode until next successful login."""
+        self._login_failed_latched = True
+        self._cycle_failure_count = 0
+        await self._set_status(STATUS_LOGIN_FAILED)
+
+    async def _mark_cycle_failure(self) -> None:
+        """Track failed cyclic reads and expose graded failure states."""
+        if self._login_failed_latched:
+            return
+
+        self._cycle_failure_count += 1
+        if self._cycle_failure_count == 1:
+            await self._set_status(STATUS_FAILED_ONCE)
+        elif self._cycle_failure_count == 2:
+            await self._set_status(STATUS_FAILED_TWICE)
+        else:
+            await self._set_status(STATUS_FAILED)
+
+    async def _mark_cycle_success(self) -> None:
+        """Reset cyclic failure tracking after a successful value read."""
+        if self._login_failed_latched:
+            return
+
+        self._cycle_failure_count = 0
+        await self._set_status(STATUS_UPDATING)
+
     async def _mark_successful_read(
         self,
         when: Optional[datetime] = None,
@@ -429,6 +479,7 @@ class WemCoordinator:
             self._last_successful_sensor_name = sensor_name
         self._consecutive_read_failures = 0
         self._last_read_error = None
+        await self._mark_cycle_success()
         await self._notify_status_callbacks()
 
     # ------------------------------------------------------------------
@@ -472,13 +523,13 @@ class WemCoordinator:
                     len(self.entries),
                 )
 
-            if loaded_cached_params == 0:
-                await self._await_result(self._discover_all())
-            else:
+            if loaded_cached_params > 0:
                 _LOGGER.info(
-                    "Skipping startup discovery because %d cached parameter(s) were loaded; new values will be read in the normal polling cycle",
+                    "Loaded %d cached parameter(s); startup discovery will only probe stacks with unknown values",
                     loaded_cached_params,
                 )
+
+            await self._await_result(self._discover_all())
             self._running = True
             self._poll_task = asyncio.ensure_future(self._polling_loop())
             self._start_selected_rediscover_retry()
@@ -681,6 +732,7 @@ class WemCoordinator:
             except Exception as exc:
                 self._last_read_error = f"forced-relogin-failed: {exc}"
                 _LOGGER.error("Forced re-login failed after read failures: %s", exc)
+                await self._set_login_failed_status()
         await self._notify_status_callbacks()
 
     def _handle_successful_read_attempt(self) -> None:
@@ -705,6 +757,7 @@ class WemCoordinator:
             ) as resp:
                 await resp.read()   # discard – we just want the cookie/session warm-up
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            await self._set_login_failed_status()
             _LOGGER.error(
                 "Cannot reach device at %s: %s (%r)",
                 self.base_url,
@@ -727,14 +780,21 @@ class WemCoordinator:
             ) as resp:
                 await resp.read()
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            await self._set_login_failed_status()
             _LOGGER.error("Login POST failed: %s (%r)", exc.__class__.__name__, exc)
             raise
 
         authenticated = await self._verify_authenticated_session()
         if not authenticated:
+            await self._set_login_failed_status()
             raise PermissionError(
                 f"Login failed for {self.base_url}: still receiving login page after POST."
             )
+
+        if self._login_failed_latched:
+            self._login_failed_latched = False
+            self._cycle_failure_count = 0
+            await self._set_status(STATUS_LOGIN_SUCCESSFUL)
 
         _LOGGER.info("Login completed for %s (authenticated session verified)", self.base_url)
 
@@ -1244,6 +1304,7 @@ class WemCoordinator:
                     form_field_name=p.form_field_name,
                     write_action=p.write_action,
                     write_fields=p.write_fields,
+                    is_available=True,
                 )
                 self._parameters[key] = info
                 persist_cache = True
@@ -1283,6 +1344,7 @@ class WemCoordinator:
                 info.current_value = p.current_value
                 info.last_real_value = p.current_value
                 info.last_updated = datetime.now()
+                info.is_available = True
                 if not info.has_successful_read:
                     info.has_successful_read = True
                     persist_cache = True
@@ -1337,7 +1399,9 @@ class WemCoordinator:
                 # --- regular poll ---
                 if self.entries:
                     stack = self.entries[self._current_index]
-                    await self._poll_stack(stack)
+                    poll_result = await self._poll_stack(stack)
+                    if poll_result is None:
+                        await self._mark_cycle_failure()
                     self._current_index = (self._current_index + 1) % len(self.entries)
 
                     # After one full pass over all entries, retry missing values once.
@@ -1434,6 +1498,12 @@ class WemCoordinator:
 
         if params is None:
             if has_known_params:
+                for known_param_id in known_param_ids:
+                    known_key = self.make_key(stack, known_param_id)
+                    known_info = self._parameters.get(known_key)
+                    if known_info and known_info.is_available:
+                        known_info.is_available = False
+                        await self._fire_callbacks(known_key)
                 _LOGGER.error(
                     "Polling stack %s failed after 10 attempts; keeping last known values",
                     stack[:40],
@@ -1463,6 +1533,7 @@ class WemCoordinator:
                     form_field_name=p.form_field_name,
                     write_action=p.write_action,
                     write_fields=p.write_fields,
+                    is_available=True,
                 )
                 self._parameters[key] = info
                 metadata_changed = True
@@ -1499,22 +1570,25 @@ class WemCoordinator:
                 persist_cache = True
 
             old_val = info.current_value
+            old_available = info.is_available
             if self._has_usable_value(p.current_value):
                 usable_param_ids.add(p.param_id)
                 info.current_value = p.current_value
                 info.last_real_value = p.current_value
                 info.last_updated = datetime.now()
+                info.is_available = True
                 if not info.has_successful_read:
                     info.has_successful_read = True
                     persist_cache = True
                 await self._mark_successful_read(info.last_updated, info.name)
 
-                if old_val != p.current_value:
+                if old_val != p.current_value or old_available != info.is_available:
                     _LOGGER.debug(
                         "Value changed: %s  %s → %s", p.name, old_val, p.current_value
                     )
                     await self._fire_callbacks(key)
             else:
+                info.is_available = False
                 if old_val is None:
                     info.current_value = self._initial_default_value(info)
                 _LOGGER.debug(
@@ -1523,6 +1597,8 @@ class WemCoordinator:
                     stack[:40],
                     old_val,
                 )
+                if old_available != info.is_available:
+                    await self._fire_callbacks(key)
 
             if persist_cache:
                 await self._save_cached_parameters()
@@ -1530,6 +1606,12 @@ class WemCoordinator:
         if track_missing and known_param_ids:
             missing = known_param_ids - usable_param_ids
             if missing:
+                for missing_param_id in missing:
+                    missing_key = self.make_key(stack, missing_param_id)
+                    missing_info = self._parameters.get(missing_key)
+                    if missing_info and missing_info.is_available:
+                        missing_info.is_available = False
+                        await self._fire_callbacks(missing_key)
                 self._missing_values_retry[stack] = missing
                 _LOGGER.warning(
                     "Polling stack %s missing %d known value(s); scheduling retry pass",
