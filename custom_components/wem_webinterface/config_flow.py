@@ -1,600 +1,540 @@
-"""Config flow for WEM Web Interface."""
+"""Config flow for WEM webinterface integration."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
 
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.core import callback
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers import selector
 
 from .const import (
-    CONF_CYCLE_INTERVAL,
-    CONF_ENTRIES,
-    CONF_INIT_SCAN_INTERVAL,
-    CONF_INIT_SCAN_MAX_ENTRIES,
-    CONF_INIT_SCAN_NOW,
-    CONF_IP_ADDRESS,
-    CONF_MAX_RETRIES,
+    CONF_BASE_URL,
+    CONF_DISABLED_MENUS,
+    CONF_DISABLED_SUBMENUS,
+    CONF_KNOWN_MENUS,
+    CONF_KNOWN_SUBMENUS,
     CONF_PASSWORD,
-    CONF_REDISCOVER_STACK,
-    CONF_RETRY_INTERVAL,
+    CONF_SCAN_INTERVAL,
     CONF_USERNAME,
-    DEFAULT_CYCLE_INTERVAL,
-    DEFAULT_INIT_SCAN_INTERVAL,
-    DEFAULT_INIT_SCAN_MAX_ENTRIES,
-    DEFAULT_MAX_RETRIES,
-    DEFAULT_RETRY_INTERVAL,
+    CONF_WAIT_SECONDS,
+    DEFAULT_BASE_URL,
+    DEFAULT_PASSWORD,
+    DEFAULT_SCAN_INTERVAL,
+    DEFAULT_USERNAME,
+    DEFAULT_WAIT_SECONDS,
     DOMAIN,
 )
+from .parser import WemPoint, WemWebClient, discover_structure, fetch_root_menus
 
 _LOGGER = logging.getLogger(__name__)
 
-
-def _parse_entries(raw: str) -> list[str]:
-    """Parse stack entries from newline- or semicolon-separated text."""
-    for sep in ("\n", ";"):
-        if sep in raw:
-            return [line.strip() for line in raw.split(sep) if line.strip()]
-    return [raw.strip()] if raw.strip() else []
+SELECTED_MENUS = "selected_menus"
+STATUS_TEXT = "status_text"
+BOOTSTRAP_CACHE_KEY = "_bootstrap_cache"
 
 
-def _safe_int(value: Any, default: int) -> int:
-    """Best-effort int conversion for persisted options values."""
-    try:
-        if value is None:
-            return default
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+def _tail_lines(text: str, max_lines: int = 24) -> str:
+    """Return newest status lines first so latest updates are visible at the top."""
+    lines = text.splitlines()
+    header = "Latest first (newest at top):"
+    if not lines:
+        return header
+
+    newest_first = list(reversed(lines[-max_lines:]))
+    body = "\n".join(newest_first)
+    if len(lines) <= max_lines:
+        return f"{header}\n{body}"
+    return f"{header}\n{body}\n..."
 
 
-def _format_scan_summary(result: Dict[str, Any]) -> str:
-    """Render compact scan details for config flow summary screens."""
-    details = result.get("details") or []
-    if not details:
-        return "No detailed menu information available."
+def _normalize_base_url(value: Any) -> str:
+    """Normalize user-provided base URL for stable login/setup usage."""
+    base_url = str(value or "").strip()
+    if not base_url:
+        return DEFAULT_BASE_URL
+    if "://" not in base_url:
+        base_url = f"http://{base_url}"
+    return base_url.rstrip("/")
 
-    lines: list[str] = []
-    for item in details[:80]:
-        stack = str(item.get("stack", ""))
-        menu = str(item.get("menu", "")).strip() or "(unknown)"
-        status = str(item.get("status", "unknown"))
-        parsed = int(item.get("parsed_params", 0) or 0)
-        nested = int(item.get("found_nested", 0) or 0)
 
-        if menu.startswith("("):
-            label = stack[:42] + ("..." if len(stack) > 42 else "")
-        else:
-            label = menu[:60]
+def _serialize_points_for_bootstrap(points: dict[str, WemPoint]) -> dict[str, dict[str, Any]]:
+    serialized: dict[str, dict[str, Any]] = {}
+    for point_id, point in points.items():
+        write_spec = None
+        if point.write_spec is not None:
+            write_spec = {
+                "action_url": point.write_spec.action_url,
+                "hidden_fields": dict(point.write_spec.hidden_fields),
+                "value_field": point.write_spec.value_field,
+                "scaling_factor": point.write_spec.scaling_factor,
+                "select_value_map": dict(point.write_spec.select_value_map),
+            }
 
-        lines.append(f"{status.upper():<7} parsed={parsed:<3} nested={nested:<3} menu={label}")
-    if len(details) > 80:
-        lines.append(f"... and {len(details) - 80} more")
-    return "\n".join(lines)
+        serialized[point_id] = {
+            "point_id": point.point_id,
+            "menu": point.menu,
+            "submenu": point.submenu,
+            "name": point.name,
+            "source_stack": point.source_stack,
+            "value": point.value,
+            "unit": point.unit,
+            "writable": point.writable,
+            "kind": point.kind,
+            "editor_stack": point.editor_stack,
+            "options": list(point.options),
+            "min_value": point.min_value,
+            "max_value": point.max_value,
+            "step": point.step,
+            "write_spec": write_spec,
+        }
+
+    return serialized
+
+
+def _menu_options(entry: config_entries.ConfigEntry) -> dict[str, str]:
+    menus = list(entry.options.get(CONF_KNOWN_MENUS, []))
+    return {menu: menu for menu in menus}
+
+
+def _submenu_options(entry: config_entries.ConfigEntry) -> dict[str, str]:
+    submenus = list(entry.options.get(CONF_KNOWN_SUBMENUS, []))
+    return {item: item for item in submenus}
 
 
 class WemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle the initial setup flow."""
+    """Handle WEM config flow."""
 
     VERSION = 1
 
     def __init__(self) -> None:
-        self._pending_user_input: Optional[Dict[str, Any]] = None
-        self._autoscan_task: Optional[Any] = None
-        self._autoscan_result: Optional[Dict[str, Any]] = None
-        self._autoscan_error: Optional[Exception] = None
-        self._autoscan_progress: Dict[str, Any] = {
-            "root_total": 0,
-            "root_done": 0,
-            "root_current_index": 0,
-            "root_current_stack": "",
-            "root_current_menu": "",
-            "processed": 0,
-        }
+        self._pending_user_input: dict[str, Any] | None = None
+        self._temp_client: WemWebClient | None = None
 
-    async def async_step_user(
-        self, user_input: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        errors: Dict[str, str] = {}
+        self._login_task: asyncio.Task | None = None
+        self._login_status: str = "Logging in..."
+        self._login_lines: list[str] = []
+
+        self._root_menus: list[tuple[str, str]] = []
+        self._selected_menus: set[str] = set()
+
+        self._scan_task: asyncio.Task | None = None
+        self._scan_tree: dict[str, dict[str, bool]] = {}
+        self._scan_progress_lines: str = "Waiting..."
+        self._scan_finalize_total: int = 0
+        self._scan_finalize_done: int = 0
+        self._scan_finalize_item: str = ""
+        self._scan_result: tuple[dict, list, list, list] | None = None
+
+    async def async_step_user(self, user_input: dict[str, Any] | None = None):
+        errors: dict[str, str] = {}
 
         if user_input is not None:
+            user_input[CONF_BASE_URL] = _normalize_base_url(user_input.get(CONF_BASE_URL))
+            await self.async_set_unique_id(user_input[CONF_BASE_URL])
+            self._abort_if_unique_id_configured()
             self._pending_user_input = dict(user_input)
-            self._autoscan_result = None
-            self._autoscan_error = None
-            self._autoscan_progress = {
-                "root_total": 0,
-                "root_done": 0,
-                "root_current_index": 0,
-                "root_current_stack": "",
-                "root_current_menu": "",
-                "processed": 0,
-            }
+            return await self.async_step_login_progress()
 
-            try:
-                self._autoscan_task = self.hass.async_create_task(
-                    self._run_initial_autoscan(self._pending_user_input)
-                )
-            except Exception as exc:
-                _LOGGER.error("Failed to start automatic initialization scan: %s", exc)
-                errors["base"] = "init_scan_failed"
-            else:
-                return await self.async_step_autoscan()
-
-        data_schema = vol.Schema(
+        schema = vol.Schema(
             {
-                vol.Required(CONF_IP_ADDRESS, default="192.168.179.36"): str,
-                vol.Required(CONF_USERNAME, default="admin"): str,
-                vol.Required(CONF_PASSWORD): str,
-                # One stack entry per line (each line may contain comma-separated IDs)
-                vol.Optional(CONF_ENTRIES, default=""): selector.TextSelector(
-                    selector.TextSelectorConfig(multiline=True)
+                vol.Required(CONF_BASE_URL, default=DEFAULT_BASE_URL): str,
+                vol.Required(CONF_USERNAME, default=DEFAULT_USERNAME): str,
+                vol.Required(CONF_PASSWORD, default=DEFAULT_PASSWORD): str,
+                vol.Required(CONF_WAIT_SECONDS, default=DEFAULT_WAIT_SECONDS): vol.All(
+                    vol.Coerce(float), vol.Range(min=0.0, max=60.0)
+                ),
+            }
+        )
+        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
+
+    async def async_step_login_progress(self, user_input: dict[str, Any] | None = None):
+        if self._pending_user_input is None:
+            return await self.async_step_user()
+
+        if self._login_task is None:
+            self._login_status = "Logging in..."
+            self._login_lines = ["Logging in..."]
+            self._login_task = self.hass.async_create_task(self._async_login_and_load_menus())
+
+        if not self._login_task.done():
+            status_text = _tail_lines("\n".join(self._login_lines), max_lines=16) or self._login_status
+            return self.async_show_form(
+                step_id="login_progress",
+                data_schema=vol.Schema(
+                    {
+                        vol.Optional(STATUS_TEXT, default=status_text): selector.TextSelector(
+                            selector.TextSelectorConfig(multiline=True)
+                        )
+                    }
+                ),
+                description_placeholders={
+                    "status": self._login_status,
+                    "status_lines": status_text,
+                },
+            )
+
+        try:
+            self._login_task.result()
+        except Exception as err:
+            _LOGGER.error("Login phase failed: %s", err)
+            await self._async_cleanup_temp_client()
+            self._login_task = None
+            return self.async_show_form(
+                step_id="user",
+                data_schema=vol.Schema(
+                    {
+                        vol.Required(
+                            CONF_BASE_URL,
+                            default=self._pending_user_input.get(CONF_BASE_URL, DEFAULT_BASE_URL),
+                        ): str,
+                        vol.Required(
+                            CONF_USERNAME,
+                            default=self._pending_user_input.get(CONF_USERNAME, DEFAULT_USERNAME),
+                        ): str,
+                        vol.Required(
+                            CONF_PASSWORD,
+                            default=self._pending_user_input.get(CONF_PASSWORD, DEFAULT_PASSWORD),
+                        ): str,
+                        vol.Required(
+                            CONF_WAIT_SECONDS,
+                            default=self._pending_user_input.get(CONF_WAIT_SECONDS, DEFAULT_WAIT_SECONDS),
+                        ): vol.All(vol.Coerce(float), vol.Range(min=0.0, max=60.0)),
+                    }
+                ),
+                errors={"base": "login_failed"},
+            )
+
+        return await self.async_step_menu_select()
+
+    async def _async_login_and_load_menus(self) -> None:
+        if self._pending_user_input is None:
+            raise RuntimeError("No user input available")
+
+        await self._async_cleanup_temp_client()
+
+        self._temp_client = WemWebClient(
+            base_url=str(self._pending_user_input[CONF_BASE_URL]),
+            username=str(self._pending_user_input[CONF_USERNAME]),
+            password=str(self._pending_user_input[CONF_PASSWORD]),
+            wait_seconds=float(self._pending_user_input[CONF_WAIT_SECONDS]),
+        )
+        await self._temp_client.async_open()
+
+        self._login_status = "Trying login..."
+        self._login_lines.append("Trying login...")
+        self.async_update_progress(0.2)
+
+        async def _on_login_progress(event: dict[str, Any]) -> None:
+            event_type = str(event.get("event") or "")
+            if event_type == "login_try":
+                attempt = event.get("try")
+                maximum = event.get("max")
+                line = f"Trying login. Try {attempt}/{maximum}"
+            elif event_type == "login_post":
+                line = "Sending login request..."
+            elif event_type == "login_verify":
+                line = "Verifying session via settings_export.html..."
+            elif event_type == "login_post_failed":
+                line = "Login POST failed, trying next target..."
+            elif event_type == "login_ok":
+                line = "Login successful."
+            elif event_type == "login_failed":
+                line = "Login failed after maximum retries."
+            else:
+                return
+
+            self._login_status = line
+            self._login_lines.append(line)
+
+        await self._temp_client.login(progress_callback=_on_login_progress)
+
+        self._login_status = "Login successful. Reading main menus..."
+        self._login_lines.append("Reading main menus...")
+        self.async_update_progress(0.7)
+
+        self._root_menus = await fetch_root_menus(self._temp_client)
+        if not self._root_menus:
+            raise RuntimeError("No menu entries found after login")
+
+        self._selected_menus = {name for name, _ in self._root_menus}
+        self._login_status = "Main menus loaded."
+        self.async_update_progress(1.0)
+
+    async def async_step_menu_select(self, user_input: dict[str, Any] | None = None):
+        if not self._root_menus:
+            return await self.async_step_user()
+
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            selected = user_input.get(SELECTED_MENUS, [])
+            if isinstance(selected, dict):
+                selected_names = {name for name, checked in selected.items() if checked}
+            else:
+                selected_names = set(selected)
+            if not selected_names:
+                errors["base"] = "no_menu_selected"
+            else:
+                self._selected_menus = selected_names
+                self._pending_user_input[CONF_SCAN_INTERVAL] = int(
+                    user_input.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+                )
+                return await self.async_step_scan_progress()
+
+        menu_names = [name for name, _ in self._root_menus]
+        menu_select = {name: name for name in menu_names}
+
+        schema = vol.Schema(
+            {
+                vol.Required(SELECTED_MENUS, default=menu_names): cv.multi_select(menu_select),
+                vol.Required(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): vol.All(
+                    vol.Coerce(int), vol.Range(min=5, max=3600)
                 ),
             }
         )
 
-        return self.async_show_form(
-            step_id="user",
-            data_schema=data_schema,
-            errors=errors,
-            description_placeholders={
-                "entries_help": (
-                    "One stack per line. Example:\n"
-                    "330000010000000000800070CF010002000301,330026000000000000800070CF020003000401\n"
-                    "060000010000000000800070CF010011000301"
-                )
-            },
-        )
+        return self.async_show_form(step_id="menu_select", data_schema=schema, errors=errors)
 
-    async def async_step_autoscan(
-        self, user_input: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """Show running autoscan status and allow skipping it."""
-        if self._autoscan_task is None:
+    async def async_step_scan_progress(self, user_input: dict[str, Any] | None = None):
+        if self._pending_user_input is None or self._temp_client is None:
             return await self.async_step_user()
 
-        if not self._autoscan_task.done():
-            if user_input is not None:
-                await self._cancel_autoscan_task()
-                if self._pending_user_input is None:
-                    return await self.async_step_user()
-                return self.async_create_entry(
-                    title=f"WEM {self._pending_user_input[CONF_IP_ADDRESS]}",
-                    data=self._pending_user_input,
-                )
+        if self._scan_task is None:
+            self._scan_task = self.hass.async_create_task(self._async_scan_selected_menus())
 
-            try:
-                placeholders = self._autoscan_description_placeholders()
-            except Exception as exc:
-                _LOGGER.debug("Error in progress placeholders: %s", exc)
-                placeholders = {
-                    "root_done": "0",
-                    "root_total": "1",
-                    "root_current_index": "1",
-                    "root_current_label": "(scanning)",
-                    "processed": "0",
-                }
-
+        if not self._scan_task.done():
+            status_text = _tail_lines(self._scan_progress_lines, max_lines=24) or "Starting initialization..."
             return self.async_show_form(
-                step_id="autoscan",
-                data_schema=vol.Schema({}),
-                description_placeholders=placeholders,
+                step_id="scan_progress",
+                data_schema=vol.Schema(
+                    {
+                        vol.Optional(STATUS_TEXT, default=status_text): selector.TextSelector(
+                            selector.TextSelectorConfig(multiline=True)
+                        )
+                    }
+                ),
+                description_placeholders={"status_lines": status_text},
             )
 
         try:
-            self._autoscan_result = self._autoscan_task.result()
-            return await self.async_step_autoscan_summary()
-        except asyncio.CancelledError:
-            _LOGGER.info("Automatic initialization scan task was cancelled")
-            return await self.async_step_autoscan_failed()
-        except Exception as exc:
-            self._autoscan_error = exc
-            _LOGGER.exception("Automatic initialization scan failed")
-            return await self.async_step_autoscan_failed()
-
-    async def _cancel_autoscan_task(self) -> None:
-        """Cancel running autoscan task when user chooses to skip."""
-        if self._autoscan_task is None or self._autoscan_task.done():
-            return
-
-        self._autoscan_task.cancel()
-        try:
-            await self._autoscan_task
-        except asyncio.CancelledError:
-            _LOGGER.info("Autoscan task cancelled by user during setup")
-        finally:
-            self._autoscan_task = None
-
-    async def async_step_autoscan_failed(
-        self, user_input: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """Handle autoscan failure by allowing setup without autoscan result."""
-        if user_input is not None and self._pending_user_input is not None:
-            return self.async_create_entry(
-                title=f"WEM {self._pending_user_input[CONF_IP_ADDRESS]}",
-                data=self._pending_user_input,
+            self._scan_result = self._scan_task.result()
+        except Exception as err:
+            _LOGGER.error("Initialization scan failed: %s", err)
+            await self._async_cleanup_temp_client()
+            return self.async_show_form(
+                step_id="menu_select",
+                data_schema=vol.Schema(
+                    {
+                        vol.Required(
+                            SELECTED_MENUS,
+                            default=[name for name, _ in self._root_menus],
+                        ): cv.multi_select({name: name for name, _ in self._root_menus}),
+                        vol.Required(
+                            CONF_SCAN_INTERVAL,
+                            default=self._pending_user_input.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+                        ): vol.All(vol.Coerce(int), vol.Range(min=5, max=3600)),
+                    }
+                ),
+                errors={"base": "scan_failed"},
             )
 
-        return self.async_show_form(
-            step_id="autoscan_failed",
-            data_schema=vol.Schema({}),
-            errors={"base": "init_scan_failed"},
+        return await self.async_step_scan_summary()
+
+    async def _async_scan_selected_menus(self):
+        if self._temp_client is None:
+            raise RuntimeError("Temporary client is missing")
+
+        self._scan_tree = {}
+        self._scan_progress_lines = "Starting initialization..."
+        self._scan_finalize_total = 0
+        self._scan_finalize_done = 0
+        self._scan_finalize_item = ""
+        self.async_update_progress(0.0)
+
+        async def _on_progress(event: dict[str, Any]) -> None:
+            event_type = event.get("event")
+            menu = str(event.get("menu") or "")
+
+            if event_type == "menu":
+                submenus = [str(name) for name in event.get("submenus") or []]
+                if submenus:
+                    self._scan_tree[menu] = {name: False for name in submenus}
+                else:
+                    self._scan_tree[menu] = {"(menu page)": False}
+            elif event_type == "submenu_done":
+                submenu = str(event.get("submenu") or "")
+                key = submenu if submenu else "(menu page)"
+                self._scan_tree.setdefault(menu, {})
+                self._scan_tree[menu][key] = True
+            elif event_type == "finalize_start":
+                self._scan_finalize_total = int(event.get("total") or 0)
+                self._scan_finalize_done = 0
+                self._scan_finalize_item = ""
+            elif event_type == "finalize_step":
+                self._scan_finalize_done = int(event.get("done") or 0)
+                self._scan_finalize_item = str(event.get("item") or "")
+            elif event_type == "finalize_done":
+                self._scan_finalize_done = self._scan_finalize_total
+
+            self._scan_progress_lines = self._render_scan_lines()
+
+            menu_total = sum(len(items) for items in self._scan_tree.values())
+            menu_done = sum(1 for items in self._scan_tree.values() for ok in items.values() if ok)
+            menu_ratio = (menu_done / menu_total) if menu_total else 0.0
+
+            # Reserve the final 20% for writable editor inspection phase.
+            if self._scan_finalize_total > 0:
+                finalize_ratio = self._scan_finalize_done / max(1, self._scan_finalize_total)
+            else:
+                finalize_ratio = 0.0
+
+            ratio = min(1.0, 0.8 * menu_ratio + 0.2 * finalize_ratio)
+            self.async_update_progress(ratio)
+
+        result = await discover_structure(
+            self._temp_client,
+            selected_menus=self._selected_menus,
+            progress_callback=_on_progress,
         )
+        self._scan_progress_lines = self._render_scan_lines()
+        self.async_update_progress(1.0)
+        return result
 
-    async def async_step_autoscan_summary(
-        self, user_input: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """Show autoscan summary and finalize config entry."""
-        if self._pending_user_input is None:
+    def _render_scan_lines(self) -> str:
+        lines: list[str] = []
+        for menu, subitems in self._scan_tree.items():
+            lines.append(f"- {menu}")
+            for name, done in subitems.items():
+                mark = "[x]" if done else "[ ]"
+                lines.append(f"  {mark} {name}")
+        if self._scan_finalize_total > 0:
+            lines.append("")
+            line = f"Finalizing writable items: {self._scan_finalize_done}/{self._scan_finalize_total}"
+            if self._scan_finalize_item:
+                line = f"{line}: {self._scan_finalize_item}"
+            lines.append(line)
+        if not lines:
+            return "Starting initialization..."
+        return "\n".join(lines)
+
+    async def async_step_scan_summary(self, user_input: dict[str, Any] | None = None):
+        if self._pending_user_input is None or self._scan_result is None:
             return await self.async_step_user()
 
         if user_input is not None:
+            points, pages, known_menus, known_submenus = self._scan_result
+            disabled_menus = [menu for menu in known_menus if menu not in self._selected_menus]
+            disabled_menu_set = set(disabled_menus)
+            disabled_submenus = [
+                submenu_key
+                for submenu_key in known_submenus
+                if submenu_key.split("|", 1)[0] in disabled_menu_set
+            ]
+
+            bootstrap_state = {
+                "values": {point_id: point.value for point_id, point in points.items()},
+                "points": _serialize_points_for_bootstrap(points),
+                "page_targets": [list(row) for row in pages],
+                "logged_in": False,
+                "last_update_page": "setup: bootstrap from config flow",
+                "consecutive_failures": 0,
+            }
+            domain_data = self.hass.data.setdefault(DOMAIN, {})
+            bootstrap_cache = domain_data.setdefault(BOOTSTRAP_CACHE_KEY, {})
+            bootstrap_cache[str(self._pending_user_input[CONF_BASE_URL])] = bootstrap_state
+
+            options = {
+                CONF_KNOWN_MENUS: list(known_menus),
+                CONF_KNOWN_SUBMENUS: list(known_submenus),
+                CONF_DISABLED_MENUS: disabled_menus,
+                CONF_DISABLED_SUBMENUS: disabled_submenus,
+            }
+            await self._async_cleanup_temp_client()
             return self.async_create_entry(
-                title=f"WEM {self._pending_user_input[CONF_IP_ADDRESS]}",
-                data=self._pending_user_input,
+                title="WEM Webinterface",
+                data={
+                    CONF_BASE_URL: self._pending_user_input[CONF_BASE_URL],
+                    CONF_USERNAME: self._pending_user_input[CONF_USERNAME],
+                    CONF_PASSWORD: self._pending_user_input[CONF_PASSWORD],
+                    CONF_WAIT_SECONDS: self._pending_user_input[CONF_WAIT_SECONDS],
+                    CONF_SCAN_INTERVAL: self._pending_user_input.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+                },
+                options=options,
             )
+
+        points, _pages, known_menus, known_submenus = self._scan_result
+        summary = self._render_scan_lines()
+        summary += (
+            f"\n\nDetected points: {len(points)}"
+            f"\nMain menus: {len(known_menus)}"
+            f"\nSubmenus: {len(known_submenus)}"
+        )
 
         return self.async_show_form(
-            step_id="autoscan_summary",
+            step_id="scan_summary",
             data_schema=vol.Schema({}),
-            description_placeholders={
-                "summary": _format_scan_summary(self._autoscan_result or {}),
-            },
+            description_placeholders={"summary": summary},
         )
 
-    def _autoscan_description_placeholders(self) -> Dict[str, str]:
-        """Return placeholders for the progress text shown during autoscan."""
-        total = int(self._autoscan_progress.get("root_total", 0) or 0)
-        done = int(self._autoscan_progress.get("root_done", 0) or 0)
-        current_index = int(self._autoscan_progress.get("root_current_index", 0) or 0)
-        current_menu = str(self._autoscan_progress.get("root_current_menu", "") or "").strip()
-        current_stack = str(self._autoscan_progress.get("root_current_stack", "") or "").strip()
-        processed = int(self._autoscan_progress.get("processed", 0) or 0)
-
-        if current_menu:
-            label = current_menu[:70]
-        elif current_stack:
-            label = current_stack[:42] + ("..." if len(current_stack) > 42 else "")
-        else:
-            label = "(waiting for first menu)"
-
-        return {
-            "root_done": str(done),
-            "root_total": str(max(total, 1)),
-            "root_current_index": str(current_index if current_index > 0 else 1),
-            "root_current_label": label,
-            "processed": str(processed),
-        }
-
-    async def _on_autoscan_progress(self, progress: Dict[str, Any]) -> None:
-        """Receive live scan progress and push it to the frontend."""
-        self._autoscan_progress.update(progress)
-
-        total = int(self._autoscan_progress.get("root_total", 0) or 0)
-        done = int(self._autoscan_progress.get("root_done", 0) or 0)
-        current_index = int(self._autoscan_progress.get("root_current_index", 0) or 0)
-
-        ratio = 0.0
-        if total > 0:
-            in_flight = 1 if current_index > 0 and done < total else 0
-            ratio = min(1.0, (done + in_flight * 0.5) / total)
-
-        try:
-            self.async_update_progress(ratio)
-        except Exception as exc:
-            _LOGGER.debug("Failed to update progress: %s", exc)
-
-    async def _run_initial_autoscan(self, user_input: Dict[str, Any]) -> Dict[str, Any]:
-        """Run one automatic full scan during initial setup."""
-        from .coordinator import WemCoordinator
-
-        async def _set_phase(label: str) -> None:
-            await self._on_autoscan_progress(
-                {
-                    "root_total": 1,
-                    "root_done": 0,
-                    "root_current_index": 1,
-                    "root_current_stack": "",
-                    "root_current_menu": label,
-                    "processed": 0,
-                }
-            )
-
-        temp_coordinator = WemCoordinator(
-            ip_address=user_input[CONF_IP_ADDRESS],
-            username=user_input[CONF_USERNAME],
-            password=user_input[CONF_PASSWORD],
-            entries=_parse_entries(user_input.get(CONF_ENTRIES, "")),
-            cycle_interval=DEFAULT_CYCLE_INTERVAL,
-            retry_interval=DEFAULT_RETRY_INTERVAL,
-            max_retries=DEFAULT_MAX_RETRIES,
-            hass=None,
-            config_entry=None,
-        )
-
-        try:
-            _LOGGER.info("Autoscan setup started for host=%s", user_input.get(CONF_IP_ADDRESS))
-            await _set_phase("Connecting")
-            await temp_coordinator._create_session()
-            await _set_phase("Checking network")
-            await temp_coordinator._check_ip_reachability()
-            await _set_phase("Checking web interface")
-            await temp_coordinator._check_web_port_reachability()
-            await _set_phase("Logging in")
-            await temp_coordinator._login()
-            await _set_phase("Starting menu scan")
-            scan_result = await temp_coordinator.async_initialize_entries(
-                scan_interval_seconds=5,
-                max_entries=500,
-                progress_callback=self._on_autoscan_progress,
-            )
-            user_input[CONF_ENTRIES] = "\n".join(temp_coordinator.entries)
-            _LOGGER.info(
-                "Autoscan completed: processed=%s new_entries=%s failed=%s total_entries=%s",
-                scan_result.get("processed"),
-                scan_result.get("new_entries"),
-                scan_result.get("failed"),
-                scan_result.get("total_entries"),
-            )
-            return scan_result
-        except Exception:
-            _LOGGER.exception("Autoscan failed during setup for host=%s", user_input.get(CONF_IP_ADDRESS))
-            raise
-        finally:
-            await temp_coordinator.async_teardown()
+    async def _async_cleanup_temp_client(self) -> None:
+        if self._temp_client is not None:
+            await self._temp_client.async_close()
+            self._temp_client = None
 
     @staticmethod
-    @callback
     def async_get_options_flow(config_entry: config_entries.ConfigEntry):
         return WemOptionsFlow(config_entry)
 
 
 class WemOptionsFlow(config_entries.OptionsFlow):
-    """Handle options (cycle interval, retry settings)."""
+    """Handle WEM options."""
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self.config_entry = config_entry
-        self._pending_options_input: Optional[Dict[str, Any]] = None
-        self._manual_scan_task: Optional[Any] = None
-        self._manual_scan_result: Optional[Dict[str, Any]] = None
-        self._manual_scan_error: Optional[Exception] = None
+        self._config_entry = config_entry
 
-    async def async_step_init(
-        self, user_input: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        errors: Dict[str, str] = {}
-
-        try:
-            if user_input is not None:
-                run_manual_scan = bool(user_input.get(CONF_INIT_SCAN_NOW, False))
-                entries_raw = user_input.get(CONF_ENTRIES, "")
-
-                if not entries_raw.strip() and not run_manual_scan:
-                    errors[CONF_ENTRIES] = "entries_empty"
-                else:
-                    if run_manual_scan:
-                        self._pending_options_input = dict(user_input)
-                        self._manual_scan_result = None
-                        self._manual_scan_error = None
-                        try:
-                            self._manual_scan_task = self.hass.async_create_task(
-                                self._run_initialization_scan(self._pending_options_input)
-                            )
-                        except Exception as exc:
-                            _LOGGER.error("Initialization scan from options failed to start: %s", exc)
-                            errors["base"] = "init_scan_failed"
-                        else:
-                            return await self.async_step_manual_scan_progress()
-                    else:
-                        # The one-click action should not remain enabled in saved options.
-                        user_input[CONF_INIT_SCAN_NOW] = False
-                        return self.async_create_entry(title="", data=user_input)
-        except Exception:
-            _LOGGER.exception("Unhandled error while opening options flow")
-            errors["base"] = "init_scan_failed"
-
-        opts = self.config_entry.options
-        data = self.config_entry.data
-        entries_default = str(opts.get(CONF_ENTRIES, data.get(CONF_ENTRIES, "")) or "")
-        entry_lines = _parse_entries(entries_default)
-        rediscover_default = str(opts.get(CONF_REDISCOVER_STACK, "") or "")
-        rediscover_options = [
-            selector.SelectOptionDict(value="", label=""),
-            *[
-                selector.SelectOptionDict(value=entry_value, label=entry_value)
-                for entry_value in entry_lines
-            ],
-        ]
-        options_schema = vol.Schema(
-            {
-                vol.Optional(
-                    CONF_CYCLE_INTERVAL,
-                    default=_safe_int(
-                        opts.get(CONF_CYCLE_INTERVAL, DEFAULT_CYCLE_INTERVAL),
-                        DEFAULT_CYCLE_INTERVAL,
-                    ),
-                ): vol.All(vol.Coerce(int), vol.Range(min=5, max=3600)),
-                vol.Optional(
-                    CONF_RETRY_INTERVAL,
-                    default=_safe_int(
-                        opts.get(CONF_RETRY_INTERVAL, DEFAULT_RETRY_INTERVAL),
-                        DEFAULT_RETRY_INTERVAL,
-                    ),
-                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=60)),
-                vol.Optional(
-                    CONF_MAX_RETRIES,
-                    default=_safe_int(
-                        opts.get(CONF_MAX_RETRIES, DEFAULT_MAX_RETRIES),
-                        DEFAULT_MAX_RETRIES,
-                    ),
-                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=10)),
-                vol.Optional(
-                    CONF_ENTRIES,
-                    default=entries_default,
-                ): selector.TextSelector(selector.TextSelectorConfig(multiline=True)),
-                vol.Optional(
-                    CONF_REDISCOVER_STACK,
-                    default=rediscover_default,
-                ): selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=rediscover_options,
-                        mode=selector.SelectSelectorMode.DROPDOWN,
-                        custom_value=False,
-                        sort=False,
-                    )
-                ),
-                vol.Optional(
-                    CONF_INIT_SCAN_NOW,
-                    default=False,
-                ): bool,
-                vol.Optional(
-                    CONF_INIT_SCAN_INTERVAL,
-                    default=_safe_int(
-                        opts.get(CONF_INIT_SCAN_INTERVAL, DEFAULT_INIT_SCAN_INTERVAL),
-                        DEFAULT_INIT_SCAN_INTERVAL,
-                    ),
-                ): vol.All(vol.Coerce(int), vol.Range(min=5, max=300)),
-                vol.Optional(
-                    CONF_INIT_SCAN_MAX_ENTRIES,
-                    default=_safe_int(
-                        opts.get(CONF_INIT_SCAN_MAX_ENTRIES, DEFAULT_INIT_SCAN_MAX_ENTRIES),
-                        DEFAULT_INIT_SCAN_MAX_ENTRIES,
-                    ),
-                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=5000)),
-            }
-        )
-
-        return self.async_show_form(step_id="init", data_schema=options_schema, errors=errors)
-
-    async def async_step_manual_scan_progress(
-        self, user_input: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """Show progress while manual initialization scan runs from options."""
-        if self._manual_scan_task is None:
-            return await self.async_step_init()
-
-        if not self._manual_scan_task.done():
-            return self.async_show_progress(
-                step_id="manual_scan_progress",
-                progress_action="manual_init_scan",
-                progress_task=self._manual_scan_task,
-            )
-
-        try:
-            self._manual_scan_result = self._manual_scan_task.result()
-            return await self.async_step_manual_scan_summary()
-        except asyncio.CancelledError:
-            _LOGGER.info("Manual initialization scan task was cancelled")
-            return await self.async_step_manual_scan_failed()
-        except Exception as exc:
-            self._manual_scan_error = exc
-            _LOGGER.exception("Initialization scan from options failed")
-            return await self.async_step_manual_scan_failed()
-
-    async def async_step_manual_scan_summary(
-        self, user_input: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """Show manual scan summary and persist options on confirmation."""
-        if self._pending_options_input is None or self._manual_scan_result is None:
-            return await self.async_step_init()
-
+    async def async_step_init(self, user_input: dict[str, Any] | None = None):
         if user_input is not None:
-            data = dict(self._pending_options_input)
-            data[CONF_ENTRIES] = "\n".join(self._manual_scan_result.get("entries", []))
-            data[CONF_INIT_SCAN_NOW] = False
-            data[CONF_REDISCOVER_STACK] = str(data.get(CONF_REDISCOVER_STACK, "") or "")
-            return self.async_create_entry(title="", data=data)
+            return self.async_create_entry(title="", data=user_input)
 
-        return self.async_show_form(
-            step_id="manual_scan_summary",
-            data_schema=vol.Schema({}),
-            description_placeholders={
-                "summary": _format_scan_summary(self._manual_scan_result.get("scan_result", {})),
-            },
-        )
+        options = self._config_entry.options
+        data = self._config_entry.data
 
-    async def async_step_manual_scan_failed(
-        self, user_input: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """Show manual scan failure and allow continuing without discovered entries."""
-        if user_input is not None and self._pending_options_input is not None:
-            data = dict(self._pending_options_input)
-            data[CONF_INIT_SCAN_NOW] = False
-            data[CONF_REDISCOVER_STACK] = str(data.get(CONF_REDISCOVER_STACK, "") or "")
-            return self.async_create_entry(title="", data=data)
+        menu_opts = _menu_options(self._config_entry)
+        submenu_opts = _submenu_options(self._config_entry)
 
-        return self.async_show_form(
-            step_id="manual_scan_failed",
-            data_schema=vol.Schema({}),
-            errors={"base": "init_scan_failed"},
-        )
+        schema_dict: dict[Any, Any] = {
+            vol.Required(
+                CONF_BASE_URL,
+                default=options.get(CONF_BASE_URL, data.get(CONF_BASE_URL, DEFAULT_BASE_URL)),
+            ): str,
+            vol.Required(
+                CONF_USERNAME,
+                default=options.get(CONF_USERNAME, data.get(CONF_USERNAME, DEFAULT_USERNAME)),
+            ): str,
+            vol.Required(
+                CONF_PASSWORD,
+                default=options.get(CONF_PASSWORD, data.get(CONF_PASSWORD, DEFAULT_PASSWORD)),
+            ): str,
+            vol.Required(
+                CONF_WAIT_SECONDS,
+                default=options.get(CONF_WAIT_SECONDS, data.get(CONF_WAIT_SECONDS, DEFAULT_WAIT_SECONDS)),
+            ): vol.All(vol.Coerce(float), vol.Range(min=0.0, max=60.0)),
+            vol.Required(
+                CONF_SCAN_INTERVAL,
+                default=options.get(CONF_SCAN_INTERVAL, data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)),
+            ): vol.All(vol.Coerce(int), vol.Range(min=5, max=3600)),
+            vol.Optional(
+                CONF_DISABLED_MENUS,
+                default=options.get(CONF_DISABLED_MENUS, []),
+            ): cv.multi_select(menu_opts),
+            vol.Optional(
+                CONF_DISABLED_SUBMENUS,
+                default=options.get(CONF_DISABLED_SUBMENUS, []),
+            ): cv.multi_select(submenu_opts),
+        }
 
-    async def _run_initialization_scan(self, user_input: Dict[str, Any]) -> Dict[str, Any]:
-        """Run full recursive scan once and return entries plus scan details."""
-        from .coordinator import WemCoordinator
-
-        data = self.config_entry.data
-        opts = self.config_entry.options
-
-        temp_coordinator = WemCoordinator(
-            ip_address=data[CONF_IP_ADDRESS],
-            username=data[CONF_USERNAME],
-            password=data[CONF_PASSWORD],
-            entries=_parse_entries(user_input.get(CONF_ENTRIES, "")),
-            cycle_interval=_safe_int(
-                user_input.get(CONF_CYCLE_INTERVAL, opts.get(CONF_CYCLE_INTERVAL, DEFAULT_CYCLE_INTERVAL)),
-                DEFAULT_CYCLE_INTERVAL,
-            ),
-            retry_interval=_safe_int(
-                user_input.get(CONF_RETRY_INTERVAL, opts.get(CONF_RETRY_INTERVAL, DEFAULT_RETRY_INTERVAL)),
-                DEFAULT_RETRY_INTERVAL,
-            ),
-            max_retries=_safe_int(
-                user_input.get(CONF_MAX_RETRIES, opts.get(CONF_MAX_RETRIES, DEFAULT_MAX_RETRIES)),
-                DEFAULT_MAX_RETRIES,
-            ),
-            hass=None,
-            config_entry=self.config_entry,
-        )
-
-        interval = _safe_int(user_input.get(CONF_INIT_SCAN_INTERVAL), DEFAULT_INIT_SCAN_INTERVAL)
-        max_entries = _safe_int(
-            user_input.get(CONF_INIT_SCAN_MAX_ENTRIES),
-            DEFAULT_INIT_SCAN_MAX_ENTRIES,
-        )
-
-        try:
-            _LOGGER.info(
-                "Manual initialization scan started for host=%s (interval=%s, max_entries=%s)",
-                data.get(CONF_IP_ADDRESS),
-                interval,
-                max_entries,
-            )
-            await temp_coordinator._create_session()
-            await temp_coordinator._check_ip_reachability()
-            await temp_coordinator._check_web_port_reachability()
-            await temp_coordinator._login()
-            scan_result = await temp_coordinator.async_initialize_entries(
-                scan_interval_seconds=interval,
-                max_entries=max_entries,
-            )
-            _LOGGER.info(
-                "Manual initialization scan completed: processed=%s new_entries=%s failed=%s total_entries=%s",
-                scan_result.get("processed"),
-                scan_result.get("new_entries"),
-                scan_result.get("failed"),
-                scan_result.get("total_entries"),
-            )
-            return {
-                "entries": temp_coordinator.entries,
-                "scan_result": scan_result,
-            }
-        except Exception:
-            _LOGGER.exception("Manual initialization scan failed for host=%s", data.get(CONF_IP_ADDRESS))
-            raise
-        finally:
-            await temp_coordinator.async_teardown()
+        return self.async_show_form(step_id="init", data_schema=vol.Schema(schema_dict))

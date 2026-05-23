@@ -2,95 +2,71 @@
   "config": {
     "step": {
       "user": {
-        "title": "WEM Web Interface einrichten",
-        "description": "Verbindung zum WEM-Gerät konfigurieren.",
+        "title": "WEM Webinterface einrichten",
+        "description": "Geben Sie zuerst die Verbindungsdaten ein. Im naechsten Schritt wird eingeloggt und das Hauptmenue angezeigt.",
         "data": {
-          "ip_address": "IP-Adresse oder DNS-Name",
+          "base_url": "Basis-URL",
           "username": "Benutzername",
           "password": "Passwort",
-          "entries": "Stack-Einträge (optional, eine Zeile pro Eintrag)"
-        }
+          "wait_seconds": "Minimaler Request-Abstand (Sekunden)"
+        },
+        "submit": "Anmelden und weiter"
       },
-      "autoscan": {
-        "title": "Automatischer Initialisierungs-Scan",
-        "description": "Hauptmenü-Scan {root_done}/{root_total}. Prüfe {root_current_index}/{root_total}: {root_current_label}. Verarbeitete Seiten: {processed}.\n\nDer Scan läuft im Hintergrund weiter. Drücke unten auf den Button, um die weitere Analyse zu überspringen und die Einrichtung sofort fortzusetzen.",
-        "submit": "Analyse überspringen und fortfahren"
+      "menu_select": {
+        "title": "Hauptmenues waehlen",
+        "description": "Waehlen Sie aus, welche Hauptmenues jetzt initialisiert werden sollen.",
+        "data": {
+          "selected_menus": "Hauptmenues",
+          "scan_interval": "Update-Intervall nach der Initialisierung (Sekunden)"
+        },
+        "submit": "Initialisierung starten"
       },
-      "autoscan_summary": {
-        "title": "Automatischer Initialisierungs-Scan",
-        "description": "Scan abgeschlossen. Übersicht der geparsten Hauptmenü-Stacks:\n{summary}"
+      "login_progress": {
+        "title": "WEM Web Interface",
+        "description": "Bitte auf Aktualisieren klicken, um den Status neu zu laden.",
+        "data": {
+          "status_text": "Aktueller Status"
+        },
+        "submit": "Logdaten aktualisieren"
       },
-      "autoscan_failed": {
-        "title": "Automatischer Initialisierungs-Scan",
-        "description": "Der automatische Vollscan ist fehlgeschlagen. Du kannst trotzdem fortfahren und den Scan später über Optionen oder Service starten."
+      "scan_progress": {
+        "title": "WEM Web Interface",
+        "description": "Bitte auf Aktualisieren klicken, um den Status neu zu laden.",
+        "data": {
+          "status_text": "Initialisierungsstatus"
+        },
+        "submit": "Logdaten aktualisieren"
+      },
+      "scan_summary": {
+        "title": "Initialisierungszusammenfassung",
+        "description": "Initialisierung abgeschlossen.\n\n{summary}\n\nNach Klick auf Fertig startet Home Assistant das Einrichten des Eintrags. Die Integration verwendet dabei, wenn verfügbar, die Bootstrap-Daten aus diesem Scan, damit keine zweite vollständige Discovery nötig ist. Je nach Systemlast kann es trotzdem kurz dauern.",
+        "submit": "Fertig"
       }
     },
-    "progress": {
-      "initial_autoscan": "Hauptmenü-Scan {root_done}/{root_total}. Prüfe {root_current_index}/{root_total}: {root_current_label}. Verarbeitete Seiten: {processed}."
-    },
     "error": {
-      "entries_empty": "Es muss mindestens ein Stack-Eintrag angegeben werden.",
-      "init_scan_failed": "Automatischer Vollscan fehlgeschlagen. Verbindung prüfen und erneut versuchen."
+      "login_failed": "Login fehlgeschlagen. Bitte URL, Benutzername und Passwort pruefen.",
+      "scan_failed": "Initialisierung ist waehrend der Menueverarbeitung fehlgeschlagen.",
+      "no_menu_selected": "Bitte mindestens ein Hauptmenue auswaehlen."
     },
     "abort": {
-      "already_configured": "Gerät ist bereits konfiguriert."
+      "already_configured": "Das Geraet ist bereits konfiguriert."
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "WEM Optionen",
+        "description": "Deaktivierte Eintraege werden beim Update uebersprungen und ihre Entitaeten deaktiviert.",
         "data": {
-          "cycle_interval": "Zyklusintervall (Sekunden)",
-          "retry_interval": "Wiederholungsintervall bei unvollständiger Seite (Sekunden)",
-          "max_retries": "Maximale Wiederholungsversuche",
-          "entries": "Stack-Einträge (eine Zeile pro Eintrag)",
-          "rediscover_stack": "Einen vorhandenen Eintrag neu einlesen",
-          "init_scan_now": "Jetzt alle Einträge einlesen (einmaliger vollständiger Menü-Scan)",
-          "init_scan_interval": "Scan-Intervall zwischen Seitenabrufen (Sekunden, mindestens 5)",
-          "init_scan_max_entries": "Maximal zu scannende Einträge"
-        }
-      },
-      "manual_scan_failed": {
-        "title": "Initialisierungs-Scan",
-        "description": "Manueller Vollscan fehlgeschlagen. Du kannst trotzdem fortfahren und die aktuellen Einträge beibehalten."
-      },
-      "manual_scan_summary": {
-        "title": "Initialisierungs-Scan",
-        "description": "Manueller Scan abgeschlossen. Übersicht der geparsten Menüs:\n{summary}"
-      }
-    },
-    "progress": {
-      "manual_init_scan": "Manueller Vollscan läuft (mindestens 5 Sekunden zwischen Seitenabrufen)."
-    },
-    "error": {
-      "entries_empty": "Es muss mindestens ein Stack-Eintrag angegeben werden.",
-      "init_scan_failed": "Automatischer Vollscan fehlgeschlagen. Verbindung prüfen und erneut versuchen."
-    }
-  },
-  "services": {
-    "rediscover": {
-      "name": "Parameter neu entdecken",
-      "description": "Liest Metadaten (Wertebereich, Typ, …) für einen Stack-Eintrag neu aus.",
-      "fields": {
-        "stack": {
-          "name": "Stack",
-          "description": "Der Stack-String, der neu entdeckt werden soll (leer = alle)."
-        }
-      }
-    },
-    "initialize_scan": {
-      "name": "Initialisierungs-Scan",
-      "description": "Einmalige rekursive Erkennung aller verschachtelten Stack-Einträge mit begrenzter Abrufrate.",
-      "fields": {
-        "scan_interval": {
-          "name": "Scan-Intervall",
-          "description": "Sekunden zwischen zwei Stack-Abrufen (mindestens 5)."
+          "base_url": "Basis-URL",
+          "username": "Benutzername",
+          "password": "Passwort",
+          "wait_seconds": "Minimaler Request-Abstand (Sekunden)",
+          "scan_interval": "Update-Intervall (Sekunden)",
+          "disabled_menus": "Deaktivierte Menues",
+          "disabled_submenus": "Deaktivierte Untermenues"
         },
-        "max_entries": {
-          "name": "Maximale Einträge",
-          "description": "Sicherheitsgrenze für die Anzahl der zu verarbeitenden Stacks."
-        }
+        "submit": "Speichern"
       }
     }
   }

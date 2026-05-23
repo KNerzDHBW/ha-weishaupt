@@ -2,35 +2,51 @@
   "config": {
     "step": {
       "user": {
-        "title": "Set up WEM Web Interface",
-        "description": "Configure the connection to the WEM device.",
+        "title": "Set up WEM Webinterface",
+        "description": "Enter connection settings first. The next step will log in and show available main menus.",
         "data": {
-          "ip_address": "IP address or DNS name",
+          "base_url": "Base URL",
           "username": "Username",
           "password": "Password",
-          "entries": "Stack entries (optional, one entry per line)"
-        }
+          "wait_seconds": "Minimum request spacing (seconds)"
+        },
+        "submit": "Log in and continue"
       },
-      "autoscan": {
-        "title": "Automatic initialization scan",
-        "description": "Main menu scan {root_done}/{root_total}. Checking {root_current_index}/{root_total}: {root_current_label}. Processed pages: {processed}.\n\nThe scan keeps running in the background. Press the button below to skip further analysis and continue setup immediately.",
-        "submit": "Skip and continue"
+      "menu_select": {
+        "title": "Select main menus",
+        "description": "Choose which main menus should be initialized now.",
+        "data": {
+          "selected_menus": "Main menus",
+          "scan_interval": "Update interval after initialization (seconds)"
+        },
+        "submit": "Start initialization"
       },
-      "autoscan_summary": {
-        "title": "Automatic initialization scan",
-        "description": "Scan complete. Parsed main menu stack overview:\n{summary}"
+      "login_progress": {
+        "title": "WEM Web Interface",
+        "description": "Press Refresh to update this status.",
+        "data": {
+          "status_text": "Current status"
+        },
+        "submit": "Refresh Log Data"
       },
-      "autoscan_failed": {
-        "title": "Automatic initialization scan",
-        "description": "The automatic full scan failed. Continue anyway and run scan later from options or service."
+      "scan_progress": {
+        "title": "WEM Web Interface",
+        "description": "Press Refresh to update this status.",
+        "data": {
+          "status_text": "Initialization status"
+        },
+        "submit": "Refresh Log Data"
+      },
+      "scan_summary": {
+        "title": "Initialization summary",
+        "description": "Initialization completed.\n\n{summary}\n\nAfter you press Finish, Home Assistant starts the entry setup. The integration uses bootstrap data from this scan whenever available to avoid a second full discovery. Depending on system load, this can still take a short while.",
+        "submit": "Finish"
       }
     },
-    "progress": {
-      "initial_autoscan": "Main menu scan {root_done}/{root_total}. Checking {root_current_index}/{root_total}: {root_current_label}. Processed pages: {processed}."
-    },
     "error": {
-      "entries_empty": "At least one stack entry must be provided.",
-      "init_scan_failed": "Automatic full scan failed. Check connection and retry."
+      "login_failed": "Login failed. Check URL, username, and password.",
+      "scan_failed": "Initialization failed while processing selected menus.",
+      "no_menu_selected": "Select at least one main menu."
     },
     "abort": {
       "already_configured": "The device is already configured."
@@ -40,57 +56,17 @@
     "step": {
       "init": {
         "title": "WEM options",
+        "description": "Disabled entries are skipped in updates and their entities are disabled.",
         "data": {
-          "cycle_interval": "Cycle interval (seconds)",
-          "retry_interval": "Retry interval when the page is incomplete (seconds)",
-          "max_retries": "Maximum retries",
-          "entries": "Stack entries (one entry per line)",
-          "rediscover_stack": "Rediscover one existing entry",
-          "init_scan_now": "Read all entries now (one-time full menu scan)",
-          "init_scan_interval": "Scan interval between page loads (seconds, minimum 5)",
-          "init_scan_max_entries": "Maximum entries to scan"
-        }
-      },
-      "manual_scan_failed": {
-        "title": "Initialization scan",
-        "description": "Manual full scan failed. Continue anyway and keep current entries."
-      },
-      "manual_scan_summary": {
-        "title": "Initialization scan",
-        "description": "Manual scan complete. Parsed menu overview:\n{summary}"
-      }
-    },
-    "progress": {
-      "manual_init_scan": "Running manual full scan (minimum 5s between page loads)."
-    },
-    "error": {
-      "entries_empty": "At least one stack entry must be provided.",
-      "init_scan_failed": "Automatic full scan failed. Check connection and retry."
-    }
-  },
-  "services": {
-    "rediscover": {
-      "name": "Rediscover parameters",
-      "description": "Rediscover metadata (range, type, etc.) for one stack entry.",
-      "fields": {
-        "stack": {
-          "name": "Stack",
-          "description": "The stack string to rediscover (empty = all)."
-        }
-      }
-    },
-    "initialize_scan": {
-      "name": "Initialization scan",
-      "description": "One-time recursive discovery of nested stack entries with rate limiting.",
-      "fields": {
-        "scan_interval": {
-          "name": "Scan interval",
-          "description": "Seconds between stack fetches (minimum 5)."
+          "base_url": "Base URL",
+          "username": "Username",
+          "password": "Password",
+          "wait_seconds": "Minimum request spacing (seconds)",
+          "scan_interval": "Update interval (seconds)",
+          "disabled_menus": "Disabled menus",
+          "disabled_submenus": "Disabled submenus"
         },
-        "max_entries": {
-          "name": "Maximum entries",
-          "description": "Safety limit for the number of stacks to process."
-        }
+        "submit": "Save"
       }
     }
   }

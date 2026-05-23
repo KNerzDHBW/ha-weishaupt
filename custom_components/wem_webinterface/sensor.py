@@ -1,12 +1,8 @@
-"""Sensor platform – read-only WEM parameters."""
+"""Sensor entities for WEM integration."""
 
 from __future__ import annotations
 
-import logging
-from datetime import datetime
-from typing import Any, Optional
-
-from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
@@ -14,9 +10,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import WemCoordinator
-from .entity_base import WemBaseEntity
-
-_LOGGER = logging.getLogger(__name__)
+from .entity_base import WemPointEntity
 
 
 async def async_setup_entry(
@@ -26,242 +20,226 @@ async def async_setup_entry(
 ) -> None:
     coordinator: WemCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    entities = [
-        WemSensor(coordinator, p.stack, p.param_id)
-        for p in coordinator.get_all_parameters()
-        if p.param_type == "readonly"
+    entities: list[SensorEntity] = [
+        WemReadOnlySensor(coordinator, point_id)
+        for point_id, point in coordinator.points.items()
+        if not point.writable and coordinator.is_point_enabled(point)
     ]
-    entities.append(WemLastSuccessfulReadSensor(coordinator))
-    entities.append(WemLastSuccessfulSensorNameSensor(coordinator))
-    entities.append(WemConsecutiveReadFailuresSensor(coordinator))
-    entities.append(WemLastReadErrorSensor(coordinator))
-    entities.append(WemStatusSensor(coordinator))
+    entities.extend(
+        [
+            WemLoggedInSensor(coordinator),
+            WemStateSensor(coordinator),
+            WemLastRefreshSensor(coordinator),
+            WemSetupPhaseSensor(coordinator),
+            WemLastUpdateSensor(coordinator),
+            WemStackRecoveriesSensor(coordinator),
+            WemConsecutiveFailuresSensor(coordinator),
+        ]
+    )
     async_add_entities(entities)
 
-    # Also handle parameters discovered later (re-discovery)
-    async def _on_new_params(stack, params):
-        new_entities = [
-            WemSensor(coordinator, stack, p.param_id)
-            for p in params
-            if p.param_type == "readonly"
-        ]
+    known: set[str] = {entity._point_id for entity in entities if isinstance(entity, WemReadOnlySensor)}
+
+    def _add_new_points() -> None:
+        new_entities: list[SensorEntity] = []
+        for point_id, point in coordinator.points.items():
+            if point.writable or point_id in known:
+                continue
+            if not coordinator.is_point_enabled(point):
+                continue
+            known.add(point_id)
+            new_entities.append(WemReadOnlySensor(coordinator, point_id))
         if new_entities:
             async_add_entities(new_entities)
 
-    coordinator.register_new_param_callback(_on_new_params)
+    entry.async_on_unload(coordinator.register_point_listener(_add_new_points))
 
 
-class WemSensor(WemBaseEntity, SensorEntity):
-    """A read-only measurement from the WEM device."""
-
-    @property
-    def native_value(self) -> Any:
-        info = self._coordinator.get_parameter(self._stack, self._param_id)
-        return info.current_value if info else None
+class WemReadOnlySensor(WemPointEntity, SensorEntity):
+    """Sensor for read-only WEM values."""
 
     @property
-    def native_unit_of_measurement(self) -> Optional[str]:
-        info = self._coordinator.get_parameter(self._stack, self._param_id)
-        return (info.unit or None) if info else None
+    def native_value(self):
+        return self.point.value
 
     @property
-    def state_class(self) -> Optional[str]:
-        info = self._coordinator.get_parameter(self._stack, self._param_id)
-        if info and isinstance(info.current_value, (int, float)):
-            return "measurement"
-        return None
+    def native_unit_of_measurement(self):
+        return self.point.unit or None
 
 
-class WemLastSuccessfulReadSensor(SensorEntity):
-    """Diagnostic sensor tracking the last successful read across all parameters."""
+class WemLoggedInSensor(SensorEntity):
+    """Status sensor: logged in."""
 
-    _attr_should_poll = False
     _attr_has_entity_name = True
-    _attr_name = "Last Successful Read"
-    _attr_icon = "mdi:clock-check-outline"
+    _attr_name = "Logged in"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_device_class = SensorDeviceClass.TIMESTAMP
 
     def __init__(self, coordinator: WemCoordinator) -> None:
-        self._coordinator = coordinator
-        self._attr_unique_id = f"wem_{coordinator.ip_address}_last_successful_read"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.ip_address)},
-            "name": f"WEM {coordinator.ip_address}",
-            "manufacturer": "WEM",
-            "model": "Web Interface",
-            "configuration_url": coordinator.base_url,
-        }
-
-    async def async_added_to_hass(self) -> None:
-        self._coordinator.register_status_callback(self._handle_update)
-
-    async def async_will_remove_from_hass(self) -> None:
-        self._coordinator.unregister_status_callback(self._handle_update)
-
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
+        self.coordinator = coordinator
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_logged_in"
 
     @property
     def available(self) -> bool:
         return True
 
     @property
-    def native_value(self) -> Optional[datetime]:
-        return self._coordinator.last_successful_read
+    def native_value(self):
+        return self.coordinator.logged_in
 
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        return {"sensor_name": self._coordinator.last_successful_sensor_name}
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self.coordinator.async_add_listener(self.async_write_ha_state))
 
 
-class WemLastSuccessfulSensorNameSensor(SensorEntity):
-    """Diagnostic sensor naming the last parameter updated successfully."""
+class WemStateSensor(SensorEntity):
+    """Status sensor: summarized runtime state."""
 
-    _attr_should_poll = False
     _attr_has_entity_name = True
-    _attr_name = "Last Successful Sensor"
-    _attr_icon = "mdi:form-textbox"
+    _attr_name = "State"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, coordinator: WemCoordinator) -> None:
-        self._coordinator = coordinator
-        self._attr_unique_id = f"wem_{coordinator.ip_address}_last_successful_sensor"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.ip_address)},
-            "name": f"WEM {coordinator.ip_address}",
-            "manufacturer": "WEM",
-            "model": "Web Interface",
-            "configuration_url": coordinator.base_url,
-        }
-
-    async def async_added_to_hass(self) -> None:
-        self._coordinator.register_status_callback(self._handle_update)
-
-    async def async_will_remove_from_hass(self) -> None:
-        self._coordinator.unregister_status_callback(self._handle_update)
-
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
+        self.coordinator = coordinator
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_state"
 
     @property
     def available(self) -> bool:
         return True
 
     @property
-    def native_value(self) -> Optional[str]:
-        return self._coordinator.last_successful_sensor_name
+    def native_value(self):
+        return self.coordinator.state_text
 
-
-class WemConsecutiveReadFailuresSensor(SensorEntity):
-    """Diagnostic sensor counting consecutive failed read attempts."""
-
-    _attr_should_poll = False
-    _attr_has_entity_name = True
-    _attr_name = "Consecutive Read Failures"
-    _attr_icon = "mdi:counter"
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-
-    def __init__(self, coordinator: WemCoordinator) -> None:
-        self._coordinator = coordinator
-        self._attr_unique_id = f"wem_{coordinator.ip_address}_consecutive_read_failures"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.ip_address)},
-            "name": f"WEM {coordinator.ip_address}",
-            "manufacturer": "WEM",
-            "model": "Web Interface",
-            "configuration_url": coordinator.base_url,
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {
+            "logged_in": self.coordinator.logged_in,
+            "is_updating": self.coordinator.is_updating,
+            "consecutive_failures": self.coordinator.consecutive_failures,
+            "last_error": self.coordinator.last_error,
+            "last_update_page": self.coordinator.last_update_page,
         }
 
     async def async_added_to_hass(self) -> None:
-        self._coordinator.register_status_callback(self._handle_update)
+        self.async_on_remove(self.coordinator.async_add_listener(self.async_write_ha_state))
 
-    async def async_will_remove_from_hass(self) -> None:
-        self._coordinator.unregister_status_callback(self._handle_update)
 
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
+class WemLastRefreshSensor(SensorEntity):
+    """Status sensor: timestamp of last successful refresh."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Last Refresh"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: WemCoordinator) -> None:
+        self.coordinator = coordinator
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_last_refresh"
 
     @property
     def available(self) -> bool:
         return True
 
     @property
-    def native_value(self) -> int:
-        return self._coordinator.consecutive_read_failures
+    def native_value(self):
+        return self.coordinator.last_refresh or "unknown"
 
-
-class WemLastReadErrorSensor(SensorEntity):
-    """Diagnostic sensor exposing the last read error."""
-
-    _attr_should_poll = False
-    _attr_has_entity_name = True
-    _attr_name = "Last Read Error"
-    _attr_icon = "mdi:alert-circle-outline"
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-
-    def __init__(self, coordinator: WemCoordinator) -> None:
-        self._coordinator = coordinator
-        self._attr_unique_id = f"wem_{coordinator.ip_address}_last_read_error"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.ip_address)},
-            "name": f"WEM {coordinator.ip_address}",
-            "manufacturer": "WEM",
-            "model": "Web Interface",
-            "configuration_url": coordinator.base_url,
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {
+            "last_update_page": self.coordinator.last_update_page,
+            "logged_in": self.coordinator.logged_in,
         }
 
     async def async_added_to_hass(self) -> None:
-        self._coordinator.register_status_callback(self._handle_update)
+        self.async_on_remove(self.coordinator.async_add_listener(self.async_write_ha_state))
 
-    async def async_will_remove_from_hass(self) -> None:
-        self._coordinator.unregister_status_callback(self._handle_update)
 
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
+class WemLastUpdateSensor(SensorEntity):
+    """Status sensor: last read page."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Last Update"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: WemCoordinator) -> None:
+        self.coordinator = coordinator
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_last_update"
 
     @property
     def available(self) -> bool:
         return True
 
     @property
-    def native_value(self) -> Optional[str]:
-        return self._coordinator.last_read_error
+    def native_value(self):
+        return self.coordinator.last_update_page
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self.coordinator.async_add_listener(self.async_write_ha_state))
 
 
-class WemStatusSensor(SensorEntity):
-    """Diagnostic sensor exposing the coordinator runtime status."""
+class WemSetupPhaseSensor(SensorEntity):
+    """Status sensor: current setup phase."""
 
-    _attr_should_poll = False
     _attr_has_entity_name = True
-    _attr_name = "Status"
-    _attr_icon = "mdi:state-machine"
+    _attr_name = "Setup Phase"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, coordinator: WemCoordinator) -> None:
-        self._coordinator = coordinator
-        self._attr_unique_id = f"wem_{coordinator.ip_address}_status"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.ip_address)},
-            "name": f"WEM {coordinator.ip_address}",
-            "manufacturer": "WEM",
-            "model": "Web Interface",
-            "configuration_url": coordinator.base_url,
-        }
-
-    async def async_added_to_hass(self) -> None:
-        self._coordinator.register_status_callback(self._handle_update)
-
-    async def async_will_remove_from_hass(self) -> None:
-        self._coordinator.unregister_status_callback(self._handle_update)
-
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
+        self.coordinator = coordinator
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_setup_phase"
 
     @property
     def available(self) -> bool:
         return True
 
     @property
-    def native_value(self) -> str:
-        return self._coordinator.status_value
+    def native_value(self):
+        return self.coordinator.setup_phase
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self.coordinator.async_add_listener(self.async_write_ha_state))
+
+
+class WemConsecutiveFailuresSensor(SensorEntity):
+    """Status sensor: consecutive failures."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Consecutive Failures"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: WemCoordinator) -> None:
+        self.coordinator = coordinator
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_consecutive_failures"
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    @property
+    def native_value(self):
+        return self.coordinator.consecutive_failures
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self.coordinator.async_add_listener(self.async_write_ha_state))
+
+
+class WemStackRecoveriesSensor(SensorEntity):
+    """Status sensor: total successful stack recoveries."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Stack Recoveries"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: WemCoordinator) -> None:
+        self.coordinator = coordinator
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_stack_recoveries"
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    @property
+    def native_value(self):
+        return self.coordinator.stack_recoveries
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self.coordinator.async_add_listener(self.async_write_ha_state))

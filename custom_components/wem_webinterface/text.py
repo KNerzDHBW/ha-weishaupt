@@ -1,71 +1,56 @@
-"""Text entities for WEM Web Interface integration."""
+"""Text entities for WEM integration."""
 
 from __future__ import annotations
-
-import logging
 
 from homeassistant.components.text import TextEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import WemCoordinator
-
-_LOGGER = logging.getLogger(__name__)
+from .entity_base import WemPointEntity
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
+    entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up text entities."""
-    coordinator: WemCoordinator = hass.data[DOMAIN][config_entry.entry_id]
-    async_add_entities([WemAddStackText(coordinator)])
+    coordinator: WemCoordinator = hass.data[DOMAIN][entry.entry_id]
+
+    entities = [
+        WemTextEntity(coordinator, point_id)
+        for point_id, point in coordinator.points.items()
+        if point.writable and point.kind == "text" and coordinator.is_point_enabled(point)
+    ]
+    async_add_entities(entities)
+
+    known = {entity._point_id for entity in entities}
+
+    def _add_new_points() -> None:
+        new_entities = []
+        for point_id, point in coordinator.points.items():
+            if point_id in known:
+                continue
+            if not point.writable or point.kind != "text":
+                continue
+            if not coordinator.is_point_enabled(point):
+                continue
+            known.add(point_id)
+            new_entities.append(WemTextEntity(coordinator, point_id))
+        if new_entities:
+            async_add_entities(new_entities)
+
+    entry.async_on_unload(coordinator.register_point_listener(_add_new_points))
 
 
-class WemAddStackText(TextEntity):
-    """Text entity to add a new stack."""
-
-    entity_category = EntityCategory.CONFIG
-    _attr_icon = "mdi:plus-circle"
-
-    def __init__(self, coordinator: WemCoordinator) -> None:
-        """Initialize the text entity."""
-        self.coordinator = coordinator
-        self._attr_unique_id = f"{coordinator.config_entry.entry_id}_add_stack"
-        self._attr_name = "Add Stack"
-        self._attr_native_value = ""
+class WemTextEntity(WemPointEntity, TextEntity):
+    """Writable text WEM point."""
 
     @property
-    def available(self) -> bool:
-        """Return True if coordinator is ready."""
-        return True
+    def native_value(self) -> str:
+        return str(self.point.value)
 
     async def async_set_value(self, value: str) -> None:
-        """Handle text value change."""
-        if not value or not value.strip():
-            # Empty value, just clear it
-            self._attr_native_value = ""
-            self.async_write_ha_state()
-            return
-
-        stack = value.strip()
-        _LOGGER.info("Adding and discovering new stack: %s", stack[:50])
-        
-        try:
-            # Rediscover the new stack
-            await self.coordinator.async_rediscover_stack(stack)
-            _LOGGER.info("Successfully discovered new stack: %s", stack[:50])
-            
-            # Clear the input field after successful discovery
-            self._attr_native_value = ""
-            self.async_write_ha_state()
-            
-        except Exception as exc:
-            _LOGGER.error("Failed to discover new stack %s: %s", stack[:50], exc)
-            # Keep the value so user can see what failed
-            self._attr_native_value = value
-            self.async_write_ha_state()
+        await self.coordinator.async_set_point_value(self._point_id, value)

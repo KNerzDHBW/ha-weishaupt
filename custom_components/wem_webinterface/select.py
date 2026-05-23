@@ -1,9 +1,6 @@
-"""Select platform – writable string-list WEM parameters."""
+"""Select entities for WEM integration."""
 
 from __future__ import annotations
-
-import logging
-from typing import List, Optional
 
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
@@ -12,9 +9,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import WemCoordinator
-from .entity_base import WemBaseEntity
-
-_LOGGER = logging.getLogger(__name__)
+from .entity_base import WemPointEntity
 
 
 async def async_setup_entry(
@@ -25,36 +20,46 @@ async def async_setup_entry(
     coordinator: WemCoordinator = hass.data[DOMAIN][entry.entry_id]
 
     entities = [
-        WemSelect(coordinator, p.stack, p.param_id)
-        for p in coordinator.get_all_parameters()
-        if p.param_type == "select"
+        WemSelectEntity(coordinator, point_id)
+        for point_id, point in coordinator.points.items()
+        if point.writable and point.kind == "select" and coordinator.is_point_enabled(point)
     ]
     async_add_entities(entities)
 
-    async def _on_new_params(stack, params):
-        new_entities = [
-            WemSelect(coordinator, stack, p.param_id)
-            for p in params
-            if p.param_type == "select"
-        ]
+    known = {entity._point_id for entity in entities}
+
+    def _add_new_points() -> None:
+        new_entities = []
+        for point_id, point in coordinator.points.items():
+            if point_id in known:
+                continue
+            if not point.writable or point.kind != "select":
+                continue
+            if not coordinator.is_point_enabled(point):
+                continue
+            known.add(point_id)
+            new_entities.append(WemSelectEntity(coordinator, point_id))
         if new_entities:
             async_add_entities(new_entities)
 
-    coordinator.register_new_param_callback(_on_new_params)
+    entry.async_on_unload(coordinator.register_point_listener(_add_new_points))
 
 
-class WemSelect(WemBaseEntity, SelectEntity):
-    """A writable string-list parameter on the WEM device."""
-
-    @property
-    def current_option(self) -> Optional[str]:
-        info = self._coordinator.get_parameter(self._stack, self._param_id)
-        return str(info.current_value) if (info and info.current_value is not None) else None
+class WemSelectEntity(WemPointEntity, SelectEntity):
+    """Writable selection WEM point."""
 
     @property
-    def options(self) -> List[str]:
-        info = self._coordinator.get_parameter(self._stack, self._param_id)
-        return list(info.options) if (info and info.options) else []
+    def options(self) -> list[str]:
+        return list(self.point.options)
+
+    @property
+    def current_option(self):
+        value = str(self.point.value)
+        if value in self.point.options:
+            return value
+        if self.point.options:
+            return self.point.options[0]
+        return "unknown"
 
     async def async_select_option(self, option: str) -> None:
-        await self._coordinator.request_write(self._stack, self._param_id, option)
+        await self.coordinator.async_set_point_value(self._point_id, option)

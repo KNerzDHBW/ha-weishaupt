@@ -1,30 +1,29 @@
-"""Constants for WEM Web Interface integration."""
+"""Constants for the WEM webinterface integration."""
 
 DOMAIN = "wem_webinterface"
 
-CONF_IP_ADDRESS = "ip_address"
+CONF_BASE_URL = "base_url"
 CONF_USERNAME = "username"
 CONF_PASSWORD = "password"
-CONF_ENTRIES = "entries"
-CONF_CYCLE_INTERVAL = "cycle_interval"
-CONF_RETRY_INTERVAL = "retry_interval"
-CONF_MAX_RETRIES = "max_retries"
-CONF_INIT_SCAN_NOW = "init_scan_now"
-CONF_INIT_SCAN_INTERVAL = "init_scan_interval"
-CONF_INIT_SCAN_MAX_ENTRIES = "init_scan_max_entries"
-CONF_REDISCOVER_STACK = "rediscover_stack"
+CONF_WAIT_SECONDS = "wait_seconds"
+CONF_SCAN_INTERVAL = "scan_interval"
+CONF_DISABLED_MENUS = "disabled_menus"
+CONF_DISABLED_SUBMENUS = "disabled_submenus"
+CONF_KNOWN_MENUS = "known_menus"
+CONF_KNOWN_SUBMENUS = "known_submenus"
 
-DEFAULT_CYCLE_INTERVAL = 5     # seconds between polls
-DEFAULT_RETRY_INTERVAL = 5     # seconds before retry on incomplete page
-DEFAULT_MAX_RETRIES = 3        # max retries for incomplete pages
-DEFAULT_MAX_WRITE_RETRIES = 3  # max retries for write verification
-DEFAULT_INIT_SCAN_INTERVAL = 5
-DEFAULT_INIT_SCAN_MAX_ENTRIES = 500
+DEFAULT_BASE_URL = "http://heizung.home"
+DEFAULT_USERNAME = "admin"
+DEFAULT_PASSWORD = ""
+DEFAULT_WAIT_SECONDS = 2.0
+DEFAULT_SCAN_INTERVAL = 30
 
-DEFAULT_INITIAL_ENTRIES = [
-	"330000010000000000800070CF010002000301,330026000000000000800070CF020003000401,3300260100000000E6400070CF030011010401",
-	"060000010000000000800070CF010011000301",
-	"0C0000010000000000800070CF010002000301,0C000C220000000000000070CF020003000401",
-]
+DEFAULT_MAX_HTTP_RETRIES = 4
+DEFAULT_HTTP_TIMEOUT = 20
+DEFAULT_LOGIN_ROUNDS = 5
+DEFAULT_MAX_WRITE_RETRIES = 3
 
-PLATFORMS = ["sensor", "number", "select", "button", "text"]
+STORAGE_VERSION = 1
+STORAGE_KEY = "wem_webinterface_state"
+
+PLATFORMS = ["sensor", "number", "select", "text"]

@@ -1,771 +1,836 @@
-"""
-HTML parser for WEM settings_export.html pages.
+"""WEM web client and HTML parser helpers."""
 
-Handles three cases:
-  - Writable numeric parameter  (form with number input, hidden min/max/step)
-  - Writable select parameter   (form with <select> element)
-  - Read-only table of values   (table rows with name/value pairs)
-"""
+from __future__ import annotations
 
-import re
-import logging
+import asyncio
 from dataclasses import dataclass, field
-from typing import List, Optional, Any, Tuple, Dict
+import math
+import re
+import time
+from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
-from bs4 import BeautifulSoup, Tag
+import aiohttp
+from bs4 import BeautifulSoup
 
-_LOGGER = logging.getLogger(__name__)
-
-# Common unit strings (order matters – longer first to avoid partial matches)
-_KNOWN_UNITS = [
-    "°C", "°F", "K",
-    "kWh", "kW", "Wh", "W",
-    "m³/h", "l/min", "l/h",
-    "bar", "hPa", "Pa",
-    "U/min", "rpm",
-    "Hz", "V", "A",
-    "%",
-]
+from .const import (
+    DEFAULT_HTTP_TIMEOUT,
+    DEFAULT_LOGIN_ROUNDS,
+    DEFAULT_MAX_HTTP_RETRIES,
+)
 
 
 @dataclass
-class ParsedParameter:
-    """One parameter discovered from a settings_export.html page."""
-    param_id: str           # unique within this page (slugified name)
-    name: str               # human-readable label
-    current_value: Any      # current reading (float or str)
-    param_type: str         # "number" | "select" | "readonly"
-    unit: str = ""
-    min_value: Optional[float] = None
-    max_value: Optional[float] = None
-    step: Optional[float] = None
-    options: Optional[List[str]] = None
-    form_field_name: Optional[str] = None  # HTML field name for POST
-    write_action: Optional[str] = None
-    write_fields: Optional[Dict[str, str]] = None
+class WriteSpec:
+    """Write form metadata used to set a value."""
+
+    action_url: str
+    hidden_fields: dict[str, str]
+    value_field: str
+    scaling_factor: float = 1.0
+    select_value_map: dict[str, str] = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
+@dataclass
+class WemPoint:
+    """One discovered WEM parameter."""
 
-def parse_settings_page(html: str, stack: str) -> Optional[List[ParsedParameter]]:
-    """
-    Parse a settings_export.html response.
+    point_id: str
+    menu: str
+    submenu: str
+    name: str
+    source_stack: str
+    value: Any
+    unit: str
+    writable: bool
+    kind: str
+    editor_stack: str | None = None
+    options: list[str] = field(default_factory=list)
+    min_value: float | None = None
+    max_value: float | None = None
+    step: float | None = None
+    write_spec: WriteSpec | None = None
 
-    Returns:
-        List[ParsedParameter]  – on success (may be empty list if nothing found)
-        None                   – page is incomplete / not yet loaded
-    """
-    if not html or len(html.strip()) < 50:
-        _LOGGER.debug("Page too short (%d chars) – incomplete", len(html) if html else 0)
+    @property
+    def full_name(self) -> str:
+        parts = [self.menu]
+        if self.submenu:
+            parts.append(self.submenu)
+        parts.append(self.name)
+        return " - ".join([p for p in parts if p])
+
+    @property
+    def submenu_key(self) -> str:
+        return f"{self.menu}|{self.submenu}"
+
+
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").replace("\xa0", " ")).strip()
+
+
+def _hidden_field_kind(name: str) -> str | None:
+    """Classify hidden field names for numeric bounds without false positives."""
+    tokens = [tok for tok in re.split(r"[^a-z0-9]+", (name or "").lower()) if tok]
+    token_set = set(tokens)
+    if "min" in token_set or "minimum" in token_set:
+        return "min"
+    if "max" in token_set or "maximum" in token_set:
+        return "max"
+    if (
+        "step" in token_set
+        or "inc" in token_set
+        or "increment" in token_set
+        or "schrittweite" in token_set
+    ):
+        return "step"
+    return None
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None:
         return None
-
     try:
-        soup = BeautifulSoup(html, "lxml")
-    except Exception as exc:
-        _LOGGER.error("BeautifulSoup parse error: %s", exc)
+        return float(str(value).replace(",", ".").strip())
+    except (TypeError, ValueError):
         return None
 
-    if is_login_page(soup):
-        _LOGGER.debug("Received login page instead of settings page for stack %s", stack[:30])
-        return None
 
-    if _is_incomplete(soup):
-        _LOGGER.debug("Page marked as incomplete for stack %s", stack[:30])
-        return None
-
-    result = _parse_wem_layout(soup, stack)
-    if result is not None:
-        return result
-
-    # ---- strategy 1: form with input/select  (writable) ------------------
-    result = _try_form(soup, stack)
-    if result is not None:
-        return result
-
-    # ---- strategy 2: table rows  (read-only multiple values) -------------
-    result = _try_table(soup, stack)
-    if result is not None:
-        return result
-
-    # ---- strategy 3: definition lists / labelled spans -------------------
-    result = _try_dl(soup, stack)
-    if result is not None:
-        return result
-
-    # ---- strategy 4: generic key-value search ----------------------------
-    result = _try_generic_kv(soup, stack)
-    if result is not None:
-        return result
-
-    _LOGGER.warning(
-        "No parameters found for stack %s\nHTML preview: %s",
-        stack[:40],
-        html[:600],
-    )
-    # Return empty list so callers know the page loaded but contained nothing
-    return []
+def _split_value_unit(text: str) -> tuple[Any, str]:
+    text = _normalize(text)
+    if not text:
+        return "unknown", ""
+    match = re.match(r"^([+-]?[0-9]+(?:[.,][0-9]+)?)\s*(.*)$", text)
+    if match:
+        number = _to_float(match.group(1))
+        if number is not None:
+            return number, _normalize(match.group(2))
+    return text, ""
 
 
-def _parse_wem_layout(soup: BeautifulSoup, stack: str) -> Optional[List[ParsedParameter]]:
-    """Parse the actual WEM dashboard layout used by settings_export.html."""
-    content_columns = soup.select("main.col-md-9 > div.container.mx-0 > div.row > div.col-3")
-    if not content_columns:
-        _LOGGER.debug("No content columns found in layout for stack %s", stack[:40])
-        return None
-
-    active_labels = _active_labels(soup)
-    _LOGGER.debug("Active labels for stack %s: %s", stack[:40], active_labels)
-    content_column = content_columns[-1]
-
-    # Check for writable form first
-    form = content_column.find("form")
-    if form and form.find("select"):
-        parsed = _parse_wem_writable_form(form, active_labels, stack)
-        return [parsed] if parsed else []
-
-    # Check for readonly blocks (div.nav-link.browseobj without nested form)
-    readonly_blocks = [
-        block for block in content_column.select("div.nav-link.browseobj")
-        if not block.find("form")
-    ]
-    _LOGGER.debug("Found %d readonly blocks in layout for stack %s", len(readonly_blocks), stack[:40])
-    
-    if readonly_blocks:
-        result = _parse_wem_readonly_blocks(readonly_blocks, active_labels, stack)
-        _LOGGER.debug("Parsed %d readonly parameters for stack %s", len(result), stack[:40])
-        return result
-
-    return []
+def _stack_parts(stack: str) -> list[str]:
+    return [part.strip() for part in stack.split(",") if part.strip()]
 
 
-def _active_labels(soup: BeautifulSoup) -> List[str]:
-    labels: List[str] = []
-    for node in soup.select(".nav-link.browseobj.activeobj h5"):
-        text = _normalize_text(node.get_text(" ", strip=True))
-        if text:
-            labels.append(text)
-    return labels
+def _is_direct_child_stack(parent: str, candidate: str) -> bool:
+    parent_parts = _stack_parts(parent)
+    candidate_parts = _stack_parts(candidate)
+    if len(candidate_parts) != len(parent_parts) + 1:
+        return False
+    return candidate_parts[: len(parent_parts)] == parent_parts
 
 
-def _parse_wem_writable_form(form: Tag, active_labels: List[str], stack: str) -> Optional[ParsedParameter]:
-    select = form.find("select")
-    if select is None:
-        return None
-
-    options = select.find_all("option")
-    option_texts = [_normalize_text(opt.get_text(" ", strip=True)) for opt in options]
-    numeric_values = [_to_float(text) for text in option_texts]
-    numeric_mode = bool(option_texts) and all(value is not None for value in numeric_values)
-
-    # Raw POST values can differ from visible labels (e.g. visible 20.5, raw value 205).
-    raw_option_numeric_values: List[Optional[float]] = []
-    for opt, text in zip(options, option_texts):
-        raw_attr = opt.get("value")
-        raw_value = _to_float(raw_attr) if raw_attr not in (None, "") else _to_float(text)
-        raw_option_numeric_values.append(raw_value)
-
-    selected_option = select.find("option", selected=True)
-    if selected_option is None:
-        selected_option = select.find("option")
-
-    current_text = _normalize_text(selected_option.get_text(" ", strip=True)) if selected_option else ""
-    current_value: Any = _to_float(current_text) if numeric_mode else current_text
-
-    hidden_fields: Dict[str, str] = {}
-    for hidden in form.find_all("input", {"type": "hidden"}):
-        name = hidden.get("name")
-        if name:
-            hidden_fields[name] = hidden.get("value", "")
-
-    label = _leaf_label(form)
-    name_parts = list(active_labels)
-    if label and (not name_parts or name_parts[-1] != label):
-        name_parts.append(label)
-    if not name_parts and label:
-        name_parts = [label]
-
-    if numeric_mode:
-        numeric_option_values = [value for value in numeric_values if value is not None]
-        numeric_option_values = sorted(set(numeric_option_values))
-        unit = _infer_unit(form, name_parts)
-        if not unit and any("temperatur" in part.lower() for part in name_parts):
-            unit = "°C"
-
-        scale_factor = _detect_select_scale_factor(numeric_values, raw_option_numeric_values)
-        if scale_factor <= 1.0:
-            raw_numeric = [value for value in raw_option_numeric_values if value is not None]
-            scale_factor = _detect_scale_factor(raw_numeric, unit)
-        step = _detect_step(numeric_option_values)
-        scaled_current = current_value
-        scaled_min = min(numeric_option_values) if numeric_option_values else None
-        scaled_max = max(numeric_option_values) if numeric_option_values else None
-        scaled_step = step
-
-        write_fields = dict(hidden_fields)
-        if scale_factor > 1.0:
-            write_fields["__scaling_factor__"] = str(int(scale_factor))
-
-        return ParsedParameter(
-            param_id=_slugify(" ,".join(name_parts)).replace(" ", ""),
-            name=", ".join(name_parts) if name_parts else label or stack,
-            current_value=scaled_current,
-            param_type="number",
-            unit=unit,
-            min_value=scaled_min,
-            max_value=scaled_max,
-            step=scaled_step,
-            form_field_name=select.get("name") or "value",
-            write_action=form.get("action") or "pro_save.html",
-            write_fields=write_fields,
-        )
-
-    return ParsedParameter(
-        param_id=_slugify(" ,".join(name_parts)).replace(" ", ""),
-        name=", ".join(name_parts) if name_parts else label or stack,
-        current_value=current_value,
-        param_type="select",
-        options=option_texts,
-        form_field_name=select.get("name") or "value",
-        write_action=form.get("action") or "pro_save.html",
-        write_fields=hidden_fields,
-    )
+def _stack_tail(stack: str) -> str:
+    parts = _stack_parts(stack)
+    return parts[-1] if parts else stack
 
 
-def _parse_wem_readonly_blocks(blocks: List[Tag], active_labels: List[str], stack: str) -> List[ParsedParameter]:
-    parameters: List[ParsedParameter] = []
-    prefix = active_labels[-1] if active_labels else ""
-    seen_ids: set[str] = set()
+def _extract_stack_from_tag(tag) -> str | None:
+    for attr_value in tag.attrs.values():
+        values = attr_value if isinstance(attr_value, list) else [attr_value]
+        for value in values:
+            if not isinstance(value, str) or "stack=" not in value:
+                continue
+            parsed = urlparse(value)
+            query = parse_qs(parsed.query)
+            stacks = query.get("stack", [])
+            if stacks:
+                return unquote(stacks[0]).strip()
 
-    for block_idx, block in enumerate(blocks):
-        label_node = block.find("h5")
-        if not label_node:
-            _LOGGER.debug("Block %d has no h5 label", block_idx)
-            continue
-        label = _normalize_text(label_node.get_text(" ", strip=True))
-        if not label:
-            _LOGGER.debug("Block %d has empty h5 label", block_idx)
-            continue
-
-        # Get all text from the block and extract the value part after the label
-        block_text = _normalize_text(block.get_text(" ", strip=True))
-        
-        # The value is everything after the h5 label text
-        # Try to find where the label text ends in the full block text
-        value_text = ""
-        if block_text.startswith(label):
-            # Label is at the start
-            value_text = block_text[len(label):].strip()
-        else:
-            # Label might be in the middle or with extra whitespace
-            # Find the label in the text and take everything after it
-            idx = block_text.find(label)
-            if idx >= 0:
-                value_text = block_text[idx + len(label):].strip()
-        
-        if not value_text:
-            _LOGGER.debug("Block %d (%s) has no value text", block_idx, label)
-            value_text = ""
-        
-        value, unit = _split_value_unit(value_text)
-        name = f"{prefix}, {label}" if prefix else label
-
-        # If name suggests temperature but no unit was extracted, add °C
-        if not unit and "temperatur" in name.lower():
-            unit = "°C"
-
-        param_id = _slugify(name)
-        suffix = 1
-        while param_id in seen_ids:
-            param_id = f"{_slugify(name)}_{suffix}"
-            suffix += 1
-        seen_ids.add(param_id)
-
-        param = ParsedParameter(
-            param_id=param_id,
-            name=name,
-            current_value=value,
-            param_type="readonly",
-            unit=unit,
-        )
-        
-        _LOGGER.debug(
-            "Block %d: label='%s', value='%s', unit='%s', param_id='%s'",
-            block_idx, label, value, unit, param_id
-        )
-        
-        parameters.append(param)
-
-    return parameters
+    for node in tag.find_all(True):
+        for attr_value in node.attrs.values():
+            values = attr_value if isinstance(attr_value, list) else [attr_value]
+            for value in values:
+                if not isinstance(value, str) or "stack=" not in value:
+                    continue
+                parsed = urlparse(value)
+                query = parse_qs(parsed.query)
+                stacks = query.get("stack", [])
+                if stacks:
+                    return unquote(stacks[0]).strip()
+    return None
 
 
-def _leaf_label(form: Tag) -> str:
-    parent = form.parent
-    while parent is not None:
-        label = parent.find("h5", recursive=False)
-        if label:
-            return _normalize_text(label.get_text(" ", strip=True))
-        parent = parent.parent
-    return ""
-
-
-def _detect_step(values: List[float]) -> Optional[float]:
-    """Detect raw step size from sorted numeric option values."""
-    if len(values) < 2:
-        return None
-    diffs = [round(values[i + 1] - values[i], 10) for i in range(len(values) - 1) if values[i + 1] > values[i]]
-    if not diffs:
-        return None
-    return min(diffs)
-
-
-def _detect_scale_factor(values: List[float], unit: str) -> float:
-    """Detect encoded numeric scaling (e.g., 205 means 20.5).
-
-    WEM encodes some decimal values as integers*10. We detect this primarily
-    for temperature-like units when values are implausibly large.
-    """
-    if not values:
-        return 1.0
-
-    # Only integer-like option lists are candidates for encoded scaling.
-    int_values: List[int] = []
-    for value in values:
-        if abs(value - round(value)) > 1e-9:
-            return 1.0
-        int_values.append(int(round(value)))
-
-    if not int_values:
-        return 1.0
-
-    vmax = max(abs(v) for v in int_values)
-    if vmax < 100:
-        return 1.0
-
-    lower_unit = (unit or "").strip().lower()
-    is_temp_like = lower_unit in {"°c", "°f", "k"}
-    has_half_tenths_pattern = any(abs(v) % 10 == 5 for v in int_values)
-
-    if is_temp_like and (has_half_tenths_pattern or vmax >= 120):
-        return 10.0
-
-    return 1.0
-
-
-def _detect_select_scale_factor(
-    visible_values: List[Optional[float]], raw_values: List[Optional[float]]
-) -> float:
-    """Infer scaling from select option text/value pairs (visible vs raw POST value)."""
-    ratios: List[float] = []
-    for visible, raw in zip(visible_values, raw_values):
-        if visible is None or raw is None:
-            continue
-        if abs(visible) < 1e-9:
-            continue
-        ratios.append(raw / visible)
-
-    if not ratios:
-        return 1.0
-
-    first = ratios[0]
-    if any(abs(r - first) > 1e-6 for r in ratios[1:]):
-        return 1.0
-
-    for candidate in (10.0, 100.0, 1000.0):
-        if abs(first - candidate) < 1e-3:
-            return candidate
-    return 1.0
-
-
-def _infer_unit(node: Tag, labels: List[str]) -> str:
-    text = _normalize_text(node.get_text(" ", strip=True))
-    for unit in _KNOWN_UNITS:
-        if unit and unit in text:
-            return unit
-    label_text = " ".join(labels).lower()
-    if any(token in label_text for token in ("temperatur", "solltemperatur", "raum", "vorlauf", "rücklauf")):
-        return "°C"
-    return ""
-
-
-def _normalize_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text.replace("\xa0", " ")).strip()
-
-
-# ---------------------------------------------------------------------------
-# Completeness check
-# ---------------------------------------------------------------------------
-
-def _is_incomplete(soup: BeautifulSoup) -> bool:
-    """Return True if the page hasn't finished loading."""
-    body = soup.find("body")
-    if not body:
+def _looks_incomplete(html: str) -> bool:
+    if not html or len(html.strip()) < 80:
         return True
-    body_text = body.get_text(strip=True)
-    if len(body_text) < 5:
-        return True
-    loading_phrases = ["loading...", "bitte warten", "please wait", "lade...", "wird geladen"]
-    lower = body_text.lower()
-    for phrase in loading_phrases:
-        if phrase in lower and len(body_text) < 200:
-            return True
+    lower = html.lower()
+    if "loading..." in lower or "bitte warten" in lower or "wird geladen" in lower:
+        return len(html) < 1000
     return False
 
 
-def is_login_page(soup: BeautifulSoup) -> bool:
-    """Return True when the device serves the login form instead of data."""
+def _is_login_page(html: str) -> bool:
+    soup = BeautifulSoup(html, "lxml")
     form = soup.find("form")
-    if not form:
+    if form is None:
+        return False
+    if form.find("input", {"type": "password"}) is None:
+        return False
+    action = str(form.get("action") or "").lower()
+    body = soup.get_text(" ", strip=True).lower()
+    return "login" in action or "einloggen" in body or "anmelden" in body
+
+
+def _looks_authenticated(html: str) -> bool:
+    lower = html.lower()
+    return "settings_export.html?stack=" in lower or ("browseobj" in lower and "nav-link" in lower)
+
+
+def _extract_column_links(html: str, column_index: int) -> list[tuple[str, str]]:
+    soup = BeautifulSoup(html, "lxml")
+    columns = soup.select("main .container .row > div.col-3")
+    if len(columns) <= column_index:
+        return []
+
+    result: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for link in columns[column_index].select("a.nav-link.browseobj"):
+        stack = _extract_stack_from_tag(link)
+        if not stack or stack in seen:
+            continue
+        label_node = link.find("h5")
+        label = _normalize(label_node.get_text(" ", strip=True) if label_node else "")
+        result.append((label or _stack_tail(stack), stack))
+        seen.add(stack)
+    return result
+
+
+def _extract_menu_and_submenu_labels(html: str) -> tuple[list[str], list[str]]:
+    menu = [name for name, _ in _extract_column_links(html, 0)]
+    submenu = [name for name, _ in _extract_column_links(html, 1)]
+    return menu, submenu
+
+
+def looks_like_menu_echo_page(html: str, expected_menu: str, expected_submenu: str) -> bool:
+    menu, submenu = _extract_menu_and_submenu_labels(html)
+    if not menu or not submenu:
         return False
 
-    action = (form.get("action") or "").strip().lower()
-    has_password_field = form.find("input", {"type": "password"}) is not None
-    heading = soup.find(["h1", "h2", "title"])
-    heading_text = heading.get_text(" ", strip=True).lower() if heading else ""
-    body_text = soup.get_text(" ", strip=True).lower()
+    menu_set = set(menu)
+    submenu_set = set(submenu)
+    overlap = len(menu_set & submenu_set)
 
-    return (
-        action.endswith("/login.html")
-        and has_password_field
-        and ("bitte einloggen" in body_text or "wem lokal" in heading_text)
-    )
+    if submenu_set and overlap == len(submenu_set) and len(submenu_set) >= 2:
+        return True
 
+    if expected_submenu and expected_submenu not in submenu_set:
+        if overlap >= max(1, len(submenu_set) // 2):
+            return True
 
-# ---------------------------------------------------------------------------
-# Strategy 1 – Form-based (writable parameter)
-# ---------------------------------------------------------------------------
+    if expected_submenu and expected_menu and expected_menu in submenu_set:
+        return True
 
-def _try_form(soup: BeautifulSoup, stack: str) -> Optional[List[ParsedParameter]]:
-    forms = soup.find_all("form")
-    if not forms:
-        return None
-
-    parameters: List[ParsedParameter] = []
-    for form in forms:
-        p = _parse_single_form(form, soup, stack)
-        if p:
-            parameters.append(p)
-
-    return parameters if parameters else None
+    return False
 
 
-def _parse_single_form(form: Tag, soup: BeautifulSoup, stack: str) -> Optional[ParsedParameter]:
-    name = _extract_name(soup)
-    if not name:
-        return None
+class WemWebClient:
+    """HTTP client and parser facade for WEM web pages."""
 
-    param_id = _slugify(name)
-    scaling_factor = 1.0
+    def __init__(
+        self,
+        base_url: str,
+        username: str,
+        password: str,
+        wait_seconds: float,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.username = username
+        self.password = password
+        self.wait_seconds = max(0.0, float(wait_seconds))
 
-    # --- select element → string options ---
-    sel_elem = form.find("select")
-    if sel_elem:
-        opts = [o.get_text(strip=True) for o in sel_elem.find_all("option") if o.get_text(strip=True)]
-        selected = sel_elem.find("option", selected=True)
-        current = selected.get_text(strip=True) if selected else (opts[0] if opts else None)
-        if opts:
-            return ParsedParameter(
-                param_id=param_id,
-                name=name,
-                current_value=current,
-                param_type="select",
-                options=opts,
-                form_field_name=sel_elem.get("name") or "value",
+        self._session: aiohttp.ClientSession | None = None
+        self._last_request_ts = 0.0
+
+    async def async_open(self) -> None:
+        self._session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True))
+
+    async def async_close(self) -> None:
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+
+    async def _respect_gap(self) -> None:
+        now = time.monotonic()
+        wait_for = self.wait_seconds - (now - self._last_request_ts)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        self._last_request_ts = time.monotonic()
+
+    async def _request_text(self, method: str, url: str, **kwargs: Any) -> str:
+        if self._session is None:
+            raise RuntimeError("Session not initialized")
+
+        last_error: Exception | None = None
+        for _ in range(DEFAULT_MAX_HTTP_RETRIES):
+            try:
+                await self._respect_gap()
+                timeout = aiohttp.ClientTimeout(total=DEFAULT_HTTP_TIMEOUT)
+                async with self._session.request(
+                    method,
+                    url,
+                    timeout=timeout,
+                    allow_redirects=True,
+                    **kwargs,
+                ) as response:
+                    text = await response.text()
+                    if response.status != 200:
+                        raise RuntimeError(f"HTTP {response.status} at {url}")
+                    if _looks_incomplete(text):
+                        raise RuntimeError(f"Incomplete page at {url}")
+                    return text
+            except Exception as err:
+                last_error = err
+                await asyncio.sleep(1)
+        raise RuntimeError(f"Request failed for {method} {url}: {last_error}")
+
+    async def login(self, progress_callback=None) -> None:
+        login_page_url = f"{self.base_url}/index.html"
+
+        for _round in range(1, DEFAULT_LOGIN_ROUNDS + 1):
+            await _emit_progress(
+                progress_callback,
+                {
+                    "event": "login_try",
+                    "try": _round,
+                    "max": DEFAULT_LOGIN_ROUNDS,
+                },
+            )
+            login_page_html = await self._request_text("GET", login_page_url)
+            if _looks_authenticated(login_page_html) and not _is_login_page(login_page_html):
+                await _emit_progress(progress_callback, {"event": "login_ok"})
+                return
+
+            soup = BeautifulSoup(login_page_html, "lxml")
+            form = soup.find("form")
+            action = str(form.get("action") or "login.html") if form else "login.html"
+
+            post_targets = []
+            if action.startswith("http"):
+                post_targets.append(action)
+            else:
+                post_targets.append(f"{self.base_url}/{action.lstrip('/')}")
+            for fallback in ("index.html", "login.html", ""):
+                url = f"{self.base_url}/{fallback}".rstrip("/")
+                if url not in post_targets:
+                    post_targets.append(url)
+
+            payload = {
+                "user": self.username,
+                "username": self.username,
+                "login": self.username,
+                "name": self.username,
+                "pass": self.password,
+                "password": self.password,
+                "pwd": self.password,
+            }
+
+            post_ok = False
+            for post_url in post_targets:
+                try:
+                    await _emit_progress(
+                        progress_callback,
+                        {"event": "login_post", "target": post_url},
+                    )
+                    await self._request_text(
+                        "POST",
+                        post_url,
+                        data=payload,
+                        headers={"Referer": login_page_url, "Origin": self.base_url},
+                    )
+                    post_ok = True
+                    break
+                except Exception:
+                    continue
+
+            if not post_ok:
+                await _emit_progress(
+                    progress_callback,
+                    {"event": "login_post_failed", "try": _round},
+                )
+                continue
+
+            await _emit_progress(progress_callback, {"event": "login_verify"})
+            check = await self._request_text("GET", f"{self.base_url}/settings_export.html")
+            if _looks_authenticated(check) and not _is_login_page(check):
+                await _emit_progress(progress_callback, {"event": "login_ok"})
+                return
+
+        await _emit_progress(progress_callback, {"event": "login_failed"})
+        raise PermissionError("Login failed")
+
+    async def fetch_settings_root(self) -> str:
+        return await self._request_text("GET", f"{self.base_url}/settings_export.html")
+
+    async def fetch_stack(self, stack: str) -> str:
+        return await self._request_text("GET", f"{self.base_url}/settings_export.html?stack={stack}")
+
+    async def fetch_stack_reloaded(self, stack: str) -> str:
+        return await self._request_text(
+            "GET",
+            f"{self.base_url}/settings_export.html?stack={stack}&_ts={int(time.time())}",
+        )
+
+    async def inspect_editor(self, editor_stack: str) -> tuple[dict[str, Any], WriteSpec | None]:
+        html = await self.fetch_stack(editor_stack)
+        soup = BeautifulSoup(html, "lxml")
+        form = soup.find("form")
+        if form is None:
+            return {}, None
+
+        action = str(form.get("action") or "").strip()
+        action_url = action if action.startswith("http") else f"{self.base_url}/{action.lstrip('/')}"
+        hidden_fields: dict[str, str] = {}
+        for hidden in form.find_all("input", {"type": "hidden"}):
+            name = str(hidden.get("name") or "").strip()
+            if not name:
+                continue
+            hidden_fields[name] = str(hidden.get("value") or "")
+
+        select = form.find("select")
+        if select is not None:
+            options: list[str] = []
+            select_value_map: dict[str, str] = {}
+            value_field = str(select.get("name") or "value")
+            for opt in select.find_all("option"):
+                txt = _normalize(opt.get_text(" ", strip=True))
+                if txt:
+                    options.append(txt)
+                    raw_value = str(opt.get("value") or "").strip()
+                    if raw_value:
+                        select_value_map[txt] = raw_value
+            return {"kind": "select", "options": options}, WriteSpec(
+                action_url,
+                hidden_fields,
+                value_field,
+                scaling_factor=1.0,
+                select_value_map=select_value_map,
             )
 
-    # --- number / text input ---
-    # Collect all relevant inputs
-    value_input = None
-    min_val = max_val = step_val = None
+        number_input = form.find("input", {"type": re.compile(r"^(number|text)$", re.I)})
+        if number_input is not None:
+            value_field = str(number_input.get("name") or "value")
+            current_raw = str(number_input.get("value") or "").strip()
+            current_value = _to_float(current_raw)
+            min_value = _to_float(number_input.get("min"))
+            max_value = _to_float(number_input.get("max"))
+            step_value = _to_float(number_input.get("step"))
+            scaling_factor = 1.0
+            for hidden_name, hidden_value in hidden_fields.items():
+                kind = _hidden_field_kind(hidden_name)
+                if min_value is None and kind == "min":
+                    min_value = _to_float(hidden_value)
+                if max_value is None and kind == "max":
+                    max_value = _to_float(hidden_value)
+                if step_value is None and kind == "step":
+                    step_value = _to_float(hidden_value)
 
-    for inp in form.find_all("input"):
-        itype = (inp.get("type") or "text").lower()
-        iname = (inp.get("name") or "").lower()
+            # Guard against false metadata such as maxlength=2 being read as max=2.
+            if current_value is not None:
+                if max_value is not None and max_value < current_value:
+                    max_value = None
+                if min_value is not None and min_value > current_value:
+                    min_value = None
 
-        if itype == "hidden":
-            if re.search(r"\bmin\b", iname):
-                min_val = _to_float(inp.get("value"))
-            elif re.search(r"\bmax\b", iname):
-                max_val = _to_float(inp.get("value"))
-            elif re.search(r"\bstep\b|\binc\b|\bschrittweite\b", iname):
-                step_val = _to_float(inp.get("value"))
-        elif itype in ("number", "text") and value_input is None:
-            value_input = inp
-
-    if value_input is None:
-        return None
-
-    raw_val = value_input.get("value", "")
-    raw_float = _to_float(raw_val)
-    
-    # Prefer explicit min/max/step from input attributes if not found in hiddens
-    if min_val is None:
-        min_val = _to_float(value_input.get("min"))
-    if max_val is None:
-        max_val = _to_float(value_input.get("max"))
-    if step_val is None:
-        step_val = _to_float(value_input.get("step"))
-    
-    # Detect if values are scaled by 10 (e.g., WEM stores 20.5°C as 205)
-    # Heuristic: step is ~0.1 but raw value is >= 10
-    if step_val is not None and raw_float is not None:
-        if 0.05 < step_val < 1.0 and abs(step_val - 0.1) < 0.05:
-            if raw_float >= 10:
+            # Some WEM editors store values internally scaled by 10 (e.g. 22.0 -> 220)
+            # while still exposing decimal step metadata.
+            if (
+                step_value is not None
+                and 0.0 < step_value < 1.0
+                and current_value is not None
+                and re.search(r"[.,]", current_raw) is None
+                and float(current_value).is_integer()
+                and abs(current_value) >= 10
+            ):
                 scaling_factor = 10.0
-                _LOGGER.debug("Detected 10x scaling for %s (step=%.2f, raw_val=%.1f)", name, step_val, raw_float)
 
-    current_value = _to_float(raw_val)
-    if current_value is None:
-        current_value = raw_val
-    elif scaling_factor == 10.0 and current_value is not None:
-        current_value = current_value / scaling_factor
-        if min_val is not None:
-            min_val = min_val / scaling_factor
-        if max_val is not None:
-            max_val = max_val / scaling_factor
-        if step_val is not None:
-            step_val = step_val / scaling_factor
+            return {
+                "kind": "number",
+                "min": min_value,
+                "max": max_value,
+                "step": step_value,
+            }, WriteSpec(action_url, hidden_fields, value_field, scaling_factor)
 
-    unit = _extract_unit(soup)
+        text_input = form.find("input", {"type": re.compile(r"^(text)$", re.I)})
+        if text_input is not None:
+            value_field = str(text_input.get("name") or "value")
+            return {"kind": "text"}, WriteSpec(action_url, hidden_fields, value_field)
 
-    param = ParsedParameter(
-        param_id=param_id,
-        name=name,
-        current_value=current_value,
-        param_type="number",
-        unit=unit,
-        min_value=min_val,
-        max_value=max_val,
-        step=step_val if step_val is not None else 1.0,
-        form_field_name=value_input.get("name") or "value",
-    )
-    
-    # Store scaling factor as marker for later write operations
-    if scaling_factor == 10.0:
-        param.write_fields = {"__scaling_factor__": "10"}
-    
-    return param
+        return {}, None
 
+    async def write_point(self, point: WemPoint, new_value: Any) -> None:
+        write_spec = point.write_spec
+        if write_spec is None or (
+            point.kind == "select" and not write_spec.select_value_map and point.editor_stack
+        ):
+            if not point.editor_stack:
+                raise RuntimeError(f"Point {point.point_id} is not writable")
+            _, write_spec = await self.inspect_editor(point.editor_stack)
+            if write_spec is None:
+                raise RuntimeError(f"No write form found for {point.point_id}")
+            point.write_spec = write_spec
 
-# ---------------------------------------------------------------------------
-# Strategy 2 – Table rows (read-only multi-value pages)
-# ---------------------------------------------------------------------------
+        data = dict(write_spec.hidden_fields)
 
-def _try_table(soup: BeautifulSoup, stack: str) -> Optional[List[ParsedParameter]]:
-    parameters: List[ParsedParameter] = []
-    seen_ids: set = set()
+        if point.kind == "select":
+            str_value = str(new_value)
+            if write_spec.select_value_map and str_value in write_spec.select_value_map:
+                data[write_spec.value_field] = write_spec.select_value_map[str_value]
+            elif str_value in point.options:
+                # Fallback for legacy forms without explicit option values.
+                selected_index = point.options.index(str_value)
+                data[write_spec.value_field] = str(selected_index)
+            else:
+                data[write_spec.value_field] = str_value
+        else:
+            numeric_value = None
+            try:
+                numeric_value = float(str(new_value).replace(",", "."))
+            except (TypeError, ValueError):
+                numeric_value = None
 
-    for table in soup.find_all("table"):
-        for row in table.find_all("tr"):
-            cells = row.find_all(["td", "th"])
-            if len(cells) < 2:
-                continue
+            if numeric_value is None:
+                data[write_spec.value_field] = str(new_value)
+            else:
+                if write_spec.scaling_factor > 1.0:
+                    numeric_value *= write_spec.scaling_factor
 
-            name_text = cells[0].get_text(strip=True)
-            val_text  = cells[1].get_text(strip=True)
+                if float(numeric_value).is_integer():
+                    data[write_spec.value_field] = str(int(round(numeric_value)))
+                else:
+                    data[write_spec.value_field] = str(numeric_value)
 
-            if not name_text or name_text.lower() in {"name", "wert", "value", "einheit", "bezeichnung"}:
-                continue
-
-            unit = cells[2].get_text(strip=True) if len(cells) >= 3 else ""
-            value, embedded_unit = _split_value_unit(val_text)
-            if not unit:
-                unit = embedded_unit
-
-            pid = _slugify(name_text)
-            # De-duplicate within the same page
-            base_pid = pid
-            suffix = 1
-            while pid in seen_ids:
-                pid = f"{base_pid}_{suffix}"
-                suffix += 1
-            seen_ids.add(pid)
-
-            parameters.append(ParsedParameter(
-                param_id=pid,
-                name=name_text,
-                current_value=value,
-                param_type="readonly",
-                unit=unit,
-            ))
-
-    return parameters if parameters else None
+        await self._request_text(
+            "POST",
+            write_spec.action_url,
+            data=data,
+            headers={"Referer": f"{self.base_url}/settings_export.html", "Origin": self.base_url},
+        )
 
 
-# ---------------------------------------------------------------------------
-# Strategy 3 – Definition list <dl>/<dt>/<dd>
-# ---------------------------------------------------------------------------
+def parse_points_from_page(
+    html: str,
+    menu: str,
+    submenu: str,
+    source_stack: str,
+) -> list[WemPoint]:
+    """Parse all points from one settings page."""
+    soup = BeautifulSoup(html, "lxml")
+    result: list[WemPoint] = []
 
-def _try_dl(soup: BeautifulSoup, stack: str) -> Optional[List[ParsedParameter]]:
-    parameters: List[ParsedParameter] = []
-    dts = soup.find_all("dt")
-    dds = soup.find_all("dd")
-
-    for dt, dd in zip(dts, dds):
-        name = dt.get_text(strip=True)
-        val_text = dd.get_text(strip=True)
+    for block in soup.select("div.nav-link.browseobj"):
+        label_node = block.find("h5")
+        if label_node is None:
+            continue
+        name = _normalize(label_node.get_text(" ", strip=True))
         if not name:
             continue
-        value, unit = _split_value_unit(val_text)
-        parameters.append(ParsedParameter(
-            param_id=_slugify(name),
-            name=name,
-            current_value=value,
-            param_type="readonly",
-            unit=unit,
-        ))
 
-    return parameters if parameters else None
+        inline_form = block.find("form")
+        if inline_form is not None:
+            point_id = f"{menu}|{submenu}|{name}|{source_stack}"
 
+            # Inline select forms (e.g. System mode page).
+            select = inline_form.find("select")
+            if select is not None:
+                options: list[str] = []
+                selected_text = ""
+                for opt in select.find_all("option"):
+                    text = _normalize(opt.get_text(" ", strip=True))
+                    if text:
+                        options.append(text)
+                    if opt.has_attr("selected") and text:
+                        selected_text = text
+                if not selected_text and options:
+                    selected_text = options[0]
 
-# ---------------------------------------------------------------------------
-# Strategy 4 – Generic labelled divs / spans
-# ---------------------------------------------------------------------------
+                action = str(inline_form.get("action") or "").strip()
+                action_url = action if action.startswith("http") else f"http://dummy/{action.lstrip('/')}"
+                hidden: dict[str, str] = {}
+                for hidden_node in inline_form.find_all("input", {"type": "hidden"}):
+                    hidden_name = str(hidden_node.get("name") or "").strip()
+                    if hidden_name:
+                        hidden[hidden_name] = str(hidden_node.get("value") or "")
+                value_field = str(select.get("name") or "value")
 
-def _try_generic_kv(soup: BeautifulSoup, stack: str) -> Optional[List[ParsedParameter]]:
-    """Last-resort: look for elements with CSS classes hinting at label/value pairs."""
-    parameters: List[ParsedParameter] = []
+                result.append(
+                    WemPoint(
+                        point_id=point_id,
+                        menu=menu,
+                        submenu=submenu,
+                        name=name,
+                        source_stack=source_stack,
+                        value=selected_text or "unknown",
+                        unit="",
+                        writable=True,
+                        kind="select",
+                        editor_stack=source_stack,
+                        options=options,
+                        write_spec=WriteSpec(
+                            action_url,
+                            hidden,
+                            value_field,
+                            scaling_factor=1.0,
+                            select_value_map={
+                                _normalize(opt.get_text(" ", strip=True)): str(opt.get("value") or "").strip()
+                                for opt in select.find_all("option")
+                                if _normalize(opt.get_text(" ", strip=True))
+                                and str(opt.get("value") or "").strip()
+                            },
+                        ),
+                    )
+                )
+                continue
 
-    label_pat = re.compile(r"label|name|title|bezeichnung", re.I)
-    value_pat = re.compile(r"value|val|reading|messwert|wert", re.I)
+        block_text = _normalize(block.get_text(" ", strip=True))
+        value_text = block_text[len(name) :].strip() if block_text.startswith(name) else ""
+        value, unit = _split_value_unit(value_text)
+        editor_stack = _extract_stack_from_tag(block)
 
-    value_elems = soup.find_all(class_=value_pat)
-    for velem in value_elems:
-        # Look for a sibling or nearby label
-        label_elem = velem.find_previous(class_=label_pat)
-        if not label_elem:
-            label_elem = velem.find_previous_sibling()
-        if not label_elem:
+        point_id = f"{menu}|{submenu}|{name}|{source_stack}"
+        result.append(
+            WemPoint(
+                point_id=point_id,
+                menu=menu,
+                submenu=submenu,
+                name=name,
+                source_stack=source_stack,
+                value=value,
+                unit=unit,
+                writable=editor_stack is not None,
+                kind="text",
+                editor_stack=editor_stack,
+            )
+        )
+
+    for link in soup.select("a.nav-link.browseobj"):
+        editor_stack = _extract_stack_from_tag(link)
+        if not editor_stack or not _is_direct_child_stack(source_stack, editor_stack):
             continue
 
-        name = label_elem.get_text(strip=True)
-        val_text = velem.get_text(strip=True)
-        if not name or not val_text:
+        label_node = link.find("h5")
+        if label_node is None:
+            continue
+        name = _normalize(label_node.get_text(" ", strip=True))
+        if not name:
             continue
 
-        value, unit = _split_value_unit(val_text)
-        parameters.append(ParsedParameter(
-            param_id=_slugify(name),
-            name=name,
-            current_value=value,
-            param_type="readonly",
-            unit=unit,
-        ))
+        full_text = _normalize(link.get_text(" ", strip=True))
+        value_text = full_text[len(name) :].strip() if full_text.startswith(name) else ""
+        value, unit = _split_value_unit(value_text)
 
-    return parameters if parameters else None
+        point_id = f"{menu}|{submenu}|{name}|{source_stack}"
+        if any(point.point_id == point_id for point in result):
+            continue
+
+        result.append(
+            WemPoint(
+                point_id=point_id,
+                menu=menu,
+                submenu=submenu,
+                name=name,
+                source_stack=source_stack,
+                value=value,
+                unit=unit,
+                writable=True,
+                kind="text",
+                editor_stack=editor_stack,
+            )
+        )
+
+    if not result:
+        # Read-only fallback for plain-text rendered values.
+        seen: set[str] = set()
+        for label_node in soup.find_all("h5"):
+            name = _normalize(label_node.get_text(" ", strip=True))
+            if not name:
+                continue
+            container = label_node.find_parent(["div", "li", "tr", "td", "section", "article"])
+            if container is None:
+                continue
+            container_text = _normalize(container.get_text(" ", strip=True))
+            if not container_text.startswith(name):
+                continue
+            value_text = container_text[len(name) :].strip()
+            if not value_text:
+                continue
+            point_id = f"{menu}|{submenu}|{name}|{source_stack}"
+            if point_id in seen:
+                continue
+            seen.add(point_id)
+            value, unit = _split_value_unit(value_text)
+            result.append(
+                WemPoint(
+                    point_id=point_id,
+                    menu=menu,
+                    submenu=submenu,
+                    name=name,
+                    source_stack=source_stack,
+                    value=value,
+                    unit=unit,
+                    writable=False,
+                    kind="sensor",
+                )
+            )
+
+    return result
 
 
-# ---------------------------------------------------------------------------
-# Helpers for name / unit extraction
-# ---------------------------------------------------------------------------
+async def fetch_root_menus(client: WemWebClient) -> list[tuple[str, str]]:
+    """Fetch and return visible main menu entries (name, stack)."""
+    root = await client.fetch_settings_root()
+    if _is_login_page(root):
+        await client.login()
+        root = await client.fetch_settings_root()
+    return _extract_column_links(root, 0)
 
-def _extract_name(soup: BeautifulSoup) -> Optional[str]:
-    """Extract the main parameter name from the page."""
-    # Headings first
-    for tag in ("h1", "h2", "h3", "h4"):
-        elem = soup.find(tag)
-        if elem:
-            t = elem.get_text(strip=True)
-            if t and len(t) > 2:
-                return t
 
-    # <title>
-    title = soup.find("title")
-    if title:
-        t = title.get_text(strip=True)
-        if t and t.lower() not in ("settings", "einstellungen", "wem"):
-            return t
+async def resolve_menu_submenu_stack(
+    client: WemWebClient,
+    menu_name: str,
+    submenu_name: str,
+) -> str | None:
+    """Resolve current stack ID from menu/submenu labels."""
+    wanted_menu = _normalize(menu_name)
+    wanted_submenu = _normalize(submenu_name)
 
-    # <label> elements
-    for label in soup.find_all("label"):
-        t = label.get_text(strip=True)
-        if t and len(t) > 2:
-            return t
+    root_menus = await fetch_root_menus(client)
+    menu_stack = None
+    for found_menu_name, found_menu_stack in root_menus:
+        if _normalize(found_menu_name) == wanted_menu:
+            menu_stack = found_menu_stack
+            break
 
-    # Divs/spans with suggestive class
-    for cls in ("title", "name", "parameter-name", "param-name", "heading", "bezeichnung"):
-        elem = soup.find(class_=cls)
-        if elem:
-            t = elem.get_text(strip=True)
-            if t and len(t) > 2:
-                return t
+    if menu_stack is None:
+        return None
 
-    # First non-trivial <td>
-    for td in soup.find_all("td"):
-        t = td.get_text(strip=True)
-        if t and len(t) > 2 and not t.replace(".", "").replace(",", "").isnumeric():
-            return t
+    if not wanted_submenu:
+        return menu_stack
+
+    menu_html = await client.fetch_stack(menu_stack)
+    level2_raw = _extract_column_links(menu_html, 1)
+    level2 = [(name, stack) for name, stack in level2_raw if _is_direct_child_stack(menu_stack, stack)]
+    for found_submenu_name, found_submenu_stack in level2:
+        if _normalize(found_submenu_name) == wanted_submenu:
+            return found_submenu_stack
 
     return None
 
 
-def _extract_unit(soup: BeautifulSoup) -> str:
-    """Try to find a unit string on the page."""
-    # Explicit unit element
-    for cls in ("unit", "einheit", "dimension", "uom"):
-        elem = soup.find(class_=cls)
-        if elem:
-            return elem.get_text(strip=True)
-
-    # data-unit attribute on an input
-    for inp in soup.find_all("input"):
-        u = inp.get("data-unit") or inp.get("unit", "")
-        if u:
-            return u
-
-    return ""
+async def _emit_progress(
+    progress_callback,
+    payload: dict[str, Any],
+) -> None:
+    if progress_callback is None:
+        return
+    maybe = progress_callback(payload)
+    if asyncio.iscoroutine(maybe):
+        await maybe
 
 
-# ---------------------------------------------------------------------------
-# Value / unit splitting utilities
-# ---------------------------------------------------------------------------
+async def discover_structure(
+    client: WemWebClient,
+    selected_menus: set[str] | None = None,
+    progress_callback=None,
+) -> tuple[dict[str, WemPoint], list[tuple[str, str, str]], list[str], list[str]]:
+    """Discover menu structure and all points once at initialization."""
+    points: dict[str, WemPoint] = {}
+    pages: list[tuple[str, str, str]] = []
+    known_menus: list[str] = []
+    known_submenus: list[str] = []
 
-def _split_value_unit(text: str) -> Tuple[Any, str]:
-    """
-    Split "23.5 °C" → (23.5, "°C"), "Ein" → ("Ein", ""), etc.
-    """
-    if not text:
-        return None, ""
+    level1 = await fetch_root_menus(client)
+    known_menus = [name for name, _ in level1]
 
-    for unit in _KNOWN_UNITS:
-        if text.endswith(unit):
-            val_str = text[: -len(unit)].strip()
-            return _to_float_or_str(val_str), unit
+    for menu_name, menu_stack in level1:
+        if selected_menus is not None and menu_name not in selected_menus:
+            continue
 
-    # Try splitting at last whitespace
-    parts = text.rsplit(None, 1)
-    if len(parts) == 2:
-        v = _to_float(parts[0])
-        if v is not None:
-            return v, parts[1]
+        level1_html = await client.fetch_stack(menu_stack)
 
-    return _to_float_or_str(text), ""
+        level2_raw = _extract_column_links(level1_html, 1)
+        level2 = [(name, stack) for name, stack in level2_raw if _is_direct_child_stack(menu_stack, stack)]
+
+        await _emit_progress(
+            progress_callback,
+            {
+                "event": "menu",
+                "menu": menu_name,
+                "submenus": [name for name, _ in level2],
+            },
+        )
+
+        if not level2:
+            pages.append((menu_name, "", menu_stack))
+            for point in parse_points_from_page(level1_html, menu_name, "", menu_stack):
+                points[point.point_id] = point
+            await _emit_progress(
+                progress_callback,
+                {"event": "submenu_done", "menu": menu_name, "submenu": ""},
+            )
+            continue
+
+        for submenu_name, submenu_stack in level2:
+            pages.append((menu_name, submenu_name, submenu_stack))
+            known_submenus.append(f"{menu_name}|{submenu_name}")
+            page_html = await client.fetch_stack(submenu_stack)
+            for point in parse_points_from_page(page_html, menu_name, submenu_name, submenu_stack):
+                points[point.point_id] = point
+            await _emit_progress(
+                progress_callback,
+                {"event": "submenu_done", "menu": menu_name, "submenu": submenu_name},
+            )
+
+    # One-time editor inspection for writable points to classify kind/range/options.
+    await _emit_progress(
+        progress_callback,
+        {
+            "event": "finalize_start",
+            "total": len([p for p in points.values() if p.writable and p.editor_stack]),
+        },
+    )
+
+    inspected = 0
+    for point in points.values():
+        if not point.writable or not point.editor_stack:
+            continue
+        details, write_spec = await client.inspect_editor(point.editor_stack)
+        if write_spec is not None:
+            # Replace dummy base URL used for inline forms with real base URL.
+            if write_spec.action_url.startswith("http://dummy/"):
+                write_spec.action_url = f"{client.base_url}/{write_spec.action_url.removeprefix('http://dummy/')}"
+            point.write_spec = write_spec
+
+        kind = details.get("kind")
+        if kind == "select":
+            point.kind = "select"
+            point.options = list(details.get("options", []))
+        elif kind == "number":
+            point.kind = "number"
+            point.min_value = details.get("min")
+            point.max_value = details.get("max")
+            point.step = details.get("step")
+        elif point.writable:
+            point.kind = "text"
+
+        inspected += 1
+        await _emit_progress(
+            progress_callback,
+            {
+                "event": "finalize_step",
+                "done": inspected,
+                "item": point.full_name,
+            },
+        )
+
+    await _emit_progress(progress_callback, {"event": "finalize_done"})
+
+    return points, pages, known_menus, sorted(set(known_submenus))
 
 
-def _to_float(val: Any) -> Optional[float]:
-    if val is None:
-        return None
-    try:
-        return float(str(val).replace(",", ".").strip())
-    except (ValueError, TypeError):
-        return None
-
-
-def _to_float_or_str(text: str) -> Any:
-    v = _to_float(text)
-    return v if v is not None else text.strip()
-
-
-# ---------------------------------------------------------------------------
-# Slug helper
-# ---------------------------------------------------------------------------
-
-_UMLAUT_MAP = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"})
-
-
-def _slugify(text: str) -> str:
-    text = text.lower().translate(_UMLAUT_MAP)
-    text = re.sub(r"[^a-z0-9]+", "_", text)
-    text = text.strip("_")
-    return text[:64] if text else "unknown"
+def normalize_for_compare(value: Any) -> str:
+    """Normalize runtime values for write verification."""
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isfinite(value):
+            return f"{value:.6f}".rstrip("0").rstrip(".")
+        return str(value)
+    return _normalize(str(value))

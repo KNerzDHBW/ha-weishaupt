@@ -1,0 +1,7 @@
+__pycache__
+_inspect
+.ha_config/
+**/.pyc
+*.ps1
+setup-wsl-ha.sh
+LOCAL_HA_TESTING.md

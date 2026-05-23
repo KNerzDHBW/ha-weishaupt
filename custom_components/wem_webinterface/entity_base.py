@@ -1,63 +1,53 @@
-"""Base entity for WEM Web Interface."""
+"""Entity base classes for WEM integration."""
 
 from __future__ import annotations
 
-from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import WemCoordinator
 
 
-class WemBaseEntity(Entity):
-    """Base class shared by sensor, number, and select entities."""
+class WemPointEntity(CoordinatorEntity[WemCoordinator]):
+    """Base entity for one WEM point."""
 
-    _attr_should_poll = False
     _attr_has_entity_name = True
 
-    def __init__(self, coordinator: WemCoordinator, stack: str, param_id: str) -> None:
-        self._coordinator = coordinator
-        self._stack = stack
-        self._param_id = param_id
-        info = coordinator.get_parameter(stack, param_id)
-        self._attr_name = info.name if info else param_id
-        self._attr_unique_id = (
-            f"wem_{coordinator.ip_address}_{coordinator.make_key(stack, param_id)}"
-        )
-        # Group entities by the IP of the device
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, coordinator.ip_address)},
-            "name": f"WEM {coordinator.ip_address}",
-            "manufacturer": "WEM",
-            "model": "Web Interface",
-            "configuration_url": coordinator.base_url,
-        }
+    def __init__(self, coordinator: WemCoordinator, point_id: str) -> None:
+        super().__init__(coordinator)
+        self._point_id = point_id
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    @property
+    def point(self):
+        return self.coordinator.points[self._point_id]
 
-    async def async_added_to_hass(self) -> None:
-        self._coordinator.register_update_callback(
-            self._stack, self._param_id, self._handle_update
-        )
+    @property
+    def unique_id(self) -> str:
+        return f"{self.coordinator.entry.entry_id}_{self._point_id}"
 
-    async def async_will_remove_from_hass(self) -> None:
-        self._coordinator.unregister_update_callback(
-            self._stack, self._param_id, self._handle_update
-        )
-
-    def _handle_update(self) -> None:
-        self.async_write_ha_state()
-
-    # ------------------------------------------------------------------
-    # Common properties
-    # ------------------------------------------------------------------
+    @property
+    def name(self) -> str:
+        return self.point.full_name
 
     @property
     def available(self) -> bool:
-        info = self._coordinator.get_parameter(self._stack, self._param_id)
-        return (
-            info is not None
-            and not info.discovery_failed
-            and getattr(info, "is_available", True)
-        )
+        return self.coordinator.is_point_enabled(self.point)
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {
+            "menu": self.point.menu,
+            "submenu": self.point.submenu,
+            "source_stack": self.point.source_stack,
+            "writable": self.point.writable,
+        }
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, self.coordinator.entry.entry_id)},
+            "name": "WEM Webinterface",
+            "manufacturer": "Weishaupt",
+            "model": "WEM",
+            "configuration_url": self.coordinator.base_url,
+        }

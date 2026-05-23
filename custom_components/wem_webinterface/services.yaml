@@ -1,31 +1,3 @@
-rediscover:
-  name: Rediscover parameters
-  description: Rediscover metadata (range, type, etc.) for one stack entry.
-  fields:
-    stack:
-      name: Stack
-      description: The stack string to rediscover (empty = all).
-      selector:
-        text:
-
-initialize_scan:
-  name: Initialization scan
-  description: One-time recursive discovery of nested stack entries with rate limiting.
-  fields:
-    scan_interval:
-      name: Scan interval
-      description: Seconds between stack fetches (minimum 5).
-      default: 5
-      selector:
-        number:
-          min: 5
-          max: 300
-          unit_of_measurement: seconds
-    max_entries:
-      name: Maximum entries
-      description: Safety limit for the number of stacks to process.
-      default: 500
-      selector:
-        number:
-          min: 1
-          max: 5000
+cleanup_duplicates:
+  name: Cleanup duplicate entities
+  description: Remove duplicate WEM entities caused by stack/URL changes and keep the best candidate.
