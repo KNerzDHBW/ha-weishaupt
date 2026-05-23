@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import logging
 import math
 import re
 import time
@@ -18,6 +19,9 @@ from .const import (
     DEFAULT_LOGIN_ROUNDS,
     DEFAULT_MAX_HTTP_RETRIES,
 )
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -93,6 +97,74 @@ def _to_float(value: Any) -> float | None:
         return float(str(value).replace(",", ".").strip())
     except (TypeError, ValueError):
         return None
+
+
+def _extract_numeric_token(value: Any) -> float | None:
+    """Extract first numeric token from text like '22.0 C' or '22,0'."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    direct = _to_float(text)
+    if direct is not None:
+        return direct
+
+    match = re.search(r"[+-]?[0-9]+(?:[.,][0-9]+)?", text)
+    if match is None:
+        return None
+    return _to_float(match.group(0))
+
+
+def _resolve_select_post_value(
+    requested_value: Any,
+    select_value_map: dict[str, str],
+) -> str | None:
+    """Resolve the raw POST value for a requested select option."""
+    requested_text = _normalize(str(requested_value))
+    if not requested_text:
+        return None
+
+    if requested_text in select_value_map:
+        return select_value_map[requested_text]
+
+    # Already a raw POST value.
+    for raw_value in select_value_map.values():
+        if requested_text == str(raw_value).strip():
+            return raw_value
+
+    requested_lower = requested_text.lower()
+    for option_text, raw_value in select_value_map.items():
+        if option_text.lower() == requested_lower:
+            return raw_value
+
+    requested_number = _extract_numeric_token(requested_text)
+    if requested_number is not None:
+        for option_text, raw_value in select_value_map.items():
+            option_number = _extract_numeric_token(option_text)
+            if option_number is None:
+                continue
+            if math.isclose(option_number, requested_number, rel_tol=0.0, abs_tol=1e-9):
+                return raw_value
+
+        for raw_value in select_value_map.values():
+            raw_number = _extract_numeric_token(raw_value)
+            if raw_number is None:
+                continue
+            if math.isclose(raw_number, requested_number, rel_tol=0.0, abs_tol=1e-9):
+                return raw_value
+
+        # Fallback: round to the nearest valid option value.
+        numeric_candidates: list[tuple[float, float, str]] = []
+        for option_text, raw_value in select_value_map.items():
+            option_number = _extract_numeric_token(option_text)
+            if option_number is None:
+                continue
+            numeric_candidates.append((abs(option_number - requested_number), option_number, raw_value))
+
+        if numeric_candidates:
+            _, _, nearest_raw_value = min(numeric_candidates, key=lambda item: (item[0], item[1]))
+            return nearest_raw_value
+
+    return None
 
 
 def _split_value_unit(text: str) -> tuple[Any, str]:
@@ -283,7 +355,38 @@ class WemWebClient:
                 await asyncio.sleep(1)
         raise RuntimeError(f"Request failed for {method} {url}: {last_error}")
 
+    async def _is_authenticated_session(self) -> bool:
+        """Return True if current session can access protected pages."""
+        if self._session is None:
+            return False
+
+        probe_urls = [
+            f"{self.base_url}/settings_export.html",
+            f"{self.base_url}/home.html",
+            f"{self.base_url}/settings_export.html?stack=",
+        ]
+
+        for probe_url in probe_urls:
+            try:
+                await self._respect_gap()
+                timeout = aiohttp.ClientTimeout(total=DEFAULT_HTTP_TIMEOUT)
+                async with self._session.get(
+                    probe_url,
+                    timeout=timeout,
+                    allow_redirects=True,
+                ) as response:
+                    text = await response.text()
+                    if response.status == 200 and not _is_login_page(text):
+                        return True
+            except Exception:
+                continue
+
+        return False
+
     async def login(self, progress_callback=None) -> None:
+        if self._session is None:
+            raise RuntimeError("Session not initialized")
+
         login_page_url = f"{self.base_url}/index.html"
 
         for _round in range(1, DEFAULT_LOGIN_ROUNDS + 1):
@@ -295,34 +398,86 @@ class WemWebClient:
                     "max": DEFAULT_LOGIN_ROUNDS,
                 },
             )
-            login_page_html = await self._request_text("GET", login_page_url)
-            if _looks_authenticated(login_page_html) and not _is_login_page(login_page_html):
+
+            timeout = aiohttp.ClientTimeout(total=DEFAULT_HTTP_TIMEOUT)
+
+            # Warm up cookies/session first.
+            try:
+                await self._respect_gap()
+                async with self._session.get(
+                    self.base_url,
+                    timeout=timeout,
+                    allow_redirects=True,
+                ) as response:
+                    await response.read()
+            except Exception:
+                pass
+
+            if await self._is_authenticated_session():
                 await _emit_progress(progress_callback, {"event": "login_ok"})
                 return
 
-            soup = BeautifulSoup(login_page_html, "lxml")
-            form = soup.find("form")
-            action = str(form.get("action") or "login.html") if form else "login.html"
+            login_page_html = ""
+            form_action = "login.html"
+            hidden_fields: dict[str, str] = {}
+            username_field_name = "user"
+            password_field_name = "pass"
+            try:
+                await self._respect_gap()
+                async with self._session.get(
+                    login_page_url,
+                    timeout=timeout,
+                    allow_redirects=True,
+                ) as response:
+                    login_page_html = await response.text()
+            except Exception:
+                login_page_html = ""
 
-            post_targets = []
-            if action.startswith("http"):
-                post_targets.append(action)
+            if login_page_html:
+                soup = BeautifulSoup(login_page_html, "lxml")
+                form = soup.find("form")
+                if form is not None:
+                    form_action = str(form.get("action") or "login.html")
+
+                    for hidden in form.find_all("input", {"type": "hidden"}):
+                        hidden_name = str(hidden.get("name") or "").strip()
+                        if hidden_name:
+                            hidden_fields[hidden_name] = str(hidden.get("value") or "")
+
+                    for field in form.find_all("input"):
+                        field_name = str(field.get("name") or "").strip()
+                        if not field_name:
+                            continue
+                        field_type = str(field.get("type") or "").lower().strip()
+                        lname = field_name.lower()
+
+                        if field_type == "password" or lname in {"pass", "password", "pwd"}:
+                            password_field_name = field_name
+                        elif field_type in {"text", "email", ""} and (
+                            "user" in lname or "login" in lname or "name" == lname
+                        ):
+                            username_field_name = field_name
+
+            payload = dict(hidden_fields)
+            payload[username_field_name] = self.username
+            payload[password_field_name] = self.password
+            # Compatibility aliases for differing firmware/login templates.
+            payload.setdefault("user", self.username)
+            payload.setdefault("username", self.username)
+            payload.setdefault("login", self.username)
+            payload.setdefault("pass", self.password)
+            payload.setdefault("password", self.password)
+            payload.setdefault("pwd", self.password)
+
+            post_targets: list[str] = []
+            if form_action.startswith("http"):
+                post_targets.append(form_action)
             else:
-                post_targets.append(f"{self.base_url}/{action.lstrip('/')}")
-            for fallback in ("index.html", "login.html", ""):
-                url = f"{self.base_url}/{fallback}".rstrip("/")
-                if url not in post_targets:
-                    post_targets.append(url)
-
-            payload = {
-                "user": self.username,
-                "username": self.username,
-                "login": self.username,
-                "name": self.username,
-                "pass": self.password,
-                "password": self.password,
-                "pwd": self.password,
-            }
+                post_targets.append(f"{self.base_url}/{form_action.lstrip('/')}")
+            for fallback in ("login.html", "index.html", ""):
+                fallback_url = f"{self.base_url}/{fallback}".rstrip("/")
+                if fallback_url not in post_targets:
+                    post_targets.append(fallback_url)
 
             post_ok = False
             for post_url in post_targets:
@@ -331,12 +486,15 @@ class WemWebClient:
                         progress_callback,
                         {"event": "login_post", "target": post_url},
                     )
-                    await self._request_text(
-                        "POST",
+                    await self._respect_gap()
+                    async with self._session.post(
                         post_url,
                         data=payload,
+                        timeout=timeout,
+                        allow_redirects=True,
                         headers={"Referer": login_page_url, "Origin": self.base_url},
-                    )
+                    ) as response:
+                        await response.read()
                     post_ok = True
                     break
                 except Exception:
@@ -350,8 +508,7 @@ class WemWebClient:
                 continue
 
             await _emit_progress(progress_callback, {"event": "login_verify"})
-            check = await self._request_text("GET", f"{self.base_url}/settings_export.html")
-            if _looks_authenticated(check) and not _is_login_page(check):
+            if await self._is_authenticated_session():
                 await _emit_progress(progress_callback, {"event": "login_ok"})
                 return
 
@@ -395,9 +552,10 @@ class WemWebClient:
                 txt = _normalize(opt.get_text(" ", strip=True))
                 if txt:
                     options.append(txt)
-                    raw_value = str(opt.get("value") or "").strip()
-                    if raw_value:
-                        select_value_map[txt] = raw_value
+                    raw_attr = opt.get("value")
+                    raw_value = str(raw_attr).strip() if raw_attr is not None else ""
+                    # HTML select submits option text if no explicit value attribute is set.
+                    select_value_map[txt] = raw_value or txt
             return {"kind": "select", "options": options}, WriteSpec(
                 action_url,
                 hidden_fields,
@@ -459,28 +617,53 @@ class WemWebClient:
 
     async def write_point(self, point: WemPoint, new_value: Any) -> None:
         write_spec = point.write_spec
-        if write_spec is None or (
-            point.kind == "select" and not write_spec.select_value_map and point.editor_stack
-        ):
+        if write_spec is None:
             if not point.editor_stack:
                 raise RuntimeError(f"Point {point.point_id} is not writable")
-            _, write_spec = await self.inspect_editor(point.editor_stack)
-            if write_spec is None:
+            details, refreshed_spec = await self.inspect_editor(point.editor_stack)
+            if refreshed_spec is None:
                 raise RuntimeError(f"No write form found for {point.point_id}")
-            point.write_spec = write_spec
+            write_spec = refreshed_spec
+            point.write_spec = refreshed_spec
+
+            refreshed_kind = str(details.get("kind") or "").strip().lower()
+            if refreshed_kind == "select":
+                point.kind = "select"
+                point.options = list(details.get("options", []))
+            elif refreshed_kind == "number":
+                point.kind = "number"
+                point.min_value = details.get("min")
+                point.max_value = details.get("max")
+                point.step = details.get("step")
+            elif refreshed_kind == "text" and point.kind not in {"select", "number"}:
+                point.kind = "text"
 
         data = dict(write_spec.hidden_fields)
 
-        if point.kind == "select":
-            str_value = str(new_value)
-            if write_spec.select_value_map and str_value in write_spec.select_value_map:
-                data[write_spec.value_field] = write_spec.select_value_map[str_value]
-            elif str_value in point.options:
-                # Fallback for legacy forms without explicit option values.
-                selected_index = point.options.index(str_value)
-                data[write_spec.value_field] = str(selected_index)
-            else:
-                data[write_spec.value_field] = str_value
+        is_select_write = point.kind == "select" or bool(write_spec.select_value_map)
+
+        if is_select_write:
+            resolved_raw = _resolve_select_post_value(new_value, write_spec.select_value_map)
+
+            # Refresh editor mapping once if current metadata cannot resolve the requested option.
+            if resolved_raw is None and point.editor_stack:
+                details, refreshed_spec = await self.inspect_editor(point.editor_stack)
+                if refreshed_spec is not None and details.get("kind") == "select":
+                    point.write_spec = refreshed_spec
+                    write_spec = refreshed_spec
+                    point.kind = "select"
+                    point.options = list(details.get("options", []))
+                resolved_raw = _resolve_select_post_value(new_value, write_spec.select_value_map)
+
+            _LOGGER.debug(
+                "Select write for %s: requested=%r resolved_post_value=%r field=%s options=%s",
+                point.full_name,
+                new_value,
+                resolved_raw,
+                write_spec.value_field,
+                len(write_spec.select_value_map),
+            )
+            data[write_spec.value_field] = resolved_raw if resolved_raw is not None else str(new_value)
         else:
             numeric_value = None
             try:
@@ -540,8 +723,6 @@ def parse_points_from_page(
                         options.append(text)
                     if opt.has_attr("selected") and text:
                         selected_text = text
-                if not selected_text and options:
-                    selected_text = options[0]
 
                 action = str(inline_form.get("action") or "").strip()
                 action_url = action if action.startswith("http") else f"http://dummy/{action.lstrip('/')}"
@@ -571,10 +752,13 @@ def parse_points_from_page(
                             value_field,
                             scaling_factor=1.0,
                             select_value_map={
-                                _normalize(opt.get_text(" ", strip=True)): str(opt.get("value") or "").strip()
+                                    _normalize(opt.get_text(" ", strip=True)): (
+                                        str(opt.get("value")).strip()
+                                        if opt.get("value") is not None and str(opt.get("value")).strip()
+                                        else _normalize(opt.get_text(" ", strip=True))
+                                    )
                                 for opt in select.find_all("option")
-                                if _normalize(opt.get_text(" ", strip=True))
-                                and str(opt.get("value") or "").strip()
+                                    if _normalize(opt.get_text(" ", strip=True))
                             },
                         ),
                     )
@@ -833,4 +1017,9 @@ def normalize_for_compare(value: Any) -> str:
         if isinstance(value, float) and math.isfinite(value):
             return f"{value:.6f}".rstrip("0").rstrip(".")
         return str(value)
+
+    numeric_token = _extract_numeric_token(value)
+    if numeric_token is not None and math.isfinite(numeric_token):
+        return f"{numeric_token:.6f}".rstrip("0").rstrip(".")
+
     return _normalize(str(value))

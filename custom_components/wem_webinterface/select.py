@@ -57,9 +57,7 @@ class WemSelectEntity(WemPointEntity, SelectEntity):
         value = str(self.point.value)
         if value in self.point.options:
             return value
-        if self.point.options:
-            return self.point.options[0]
-        return "unknown"
+        return None
 
     async def async_select_option(self, option: str) -> None:
         await self.coordinator.async_set_point_value(self._point_id, option)

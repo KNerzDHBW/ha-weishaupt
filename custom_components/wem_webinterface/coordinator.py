@@ -111,6 +111,60 @@ class WemCoordinator(DataUpdateCoordinator[dict[str, WemPoint]]):
             self._normalize_label(name),
         )
 
+    @staticmethod
+    def _write_signature(point: WemPoint) -> tuple[str, str] | None:
+        """Stable writable signature independent from transient point IDs."""
+        if point.write_spec is None:
+            return None
+        action_url = str(point.write_spec.action_url or "").split("?", 1)[0].rstrip("/").lower()
+        value_field = str(point.write_spec.value_field or "").strip().lower()
+        if not action_url or not value_field:
+            return None
+        return (action_url, value_field)
+
+    def _find_compatible_existing_point_id(
+        self,
+        merged: dict[str, WemPoint],
+        discovered_point: WemPoint,
+    ) -> str | None:
+        """Find existing point when submenu/stack context changed between scans."""
+        wanted_menu = self._normalize_label(discovered_point.menu)
+        wanted_submenu = self._normalize_label(discovered_point.submenu)
+        wanted_name = self._normalize_label(discovered_point.name)
+        wanted_sig = self._write_signature(discovered_point)
+
+        best_id: str | None = None
+        best_score = -1
+
+        for point_id, point in merged.items():
+            if self._normalize_label(point.menu) != wanted_menu:
+                continue
+            if self._normalize_label(point.name) != wanted_name:
+                continue
+
+            score = 0
+            point_submenu = self._normalize_label(point.submenu)
+            if point_submenu == wanted_submenu:
+                score += 4
+            elif not point_submenu or not wanted_submenu:
+                score += 2
+            else:
+                continue
+
+            point_sig = self._write_signature(point)
+            if wanted_sig and point_sig:
+                if wanted_sig != point_sig:
+                    continue
+                score += 3
+            elif wanted_sig or point_sig:
+                score += 1
+
+            if score > best_score:
+                best_score = score
+                best_id = point_id
+
+        return best_id
+
     def _set_setup_phase(self, phase: str) -> None:
         """Track setup phase for diagnostics and UI visibility."""
         if phase == self.setup_phase:
@@ -350,6 +404,8 @@ class WemCoordinator(DataUpdateCoordinator[dict[str, WemPoint]]):
                     discovered_point.name,
                 )
                 existing_id = logical_index.get(logical_key)
+                if existing_id is None:
+                    existing_id = self._find_compatible_existing_point_id(merged, discovered_point)
                 if existing_id is None:
                     merged[discovered_id] = discovered_point
                     logical_index[logical_key] = discovered_id
@@ -705,7 +761,13 @@ class WemCoordinator(DataUpdateCoordinator[dict[str, WemPoint]]):
         async with self._lock:
             for _attempt in range(DEFAULT_MAX_WRITE_RETRIES):
                 if not self.logged_in:
-                    await self.client.login()
+                    try:
+                        await self.client.login()
+                    except Exception:
+                        # Session/cookie state can become stale between long update cycles.
+                        await self.client.async_close()
+                        await self.client.async_open()
+                        await self.client.login()
                     self.logged_in = True
 
                 await self.client.write_point(point, new_value)

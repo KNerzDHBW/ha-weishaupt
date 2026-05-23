@@ -1,27 +1,63 @@
-# WEM Web Interface (Home Assistant), v0.1.14
+# WEM Web Interface (Home Assistant), v0.2.0
+
+## Warning
+
+This project documentation and large parts of the code were created with GitHub Copilot (GPT-5.3-Codex).
+No guarantee is provided for correctness, completeness, or safety.
+
+Use this integration at your own risk.
+Incorrect writes to heating parameters can set wrong operating values and may cause malfunctions or physical damage to the heating system.
+This could happen accidential due to implementation bugs by Copilot.
+
+Always verify discovered entities and writable values against official device documentation before enabling write access.
+
+## Operational Limitations
+
+- Writing values is not real-time. Depending on polling interval, request spacing, and verification retries, applying a new value can take several minutes.
+- The Weishaupt web interface is partly unstable. Intermittent page load failures, incomplete pages, and temporary login failures are expected.
+- To reduce errors, the integration performs updates with spacing between requests and retries failed operations.
+- Do not use the Weishaupt web interface in parallel (browser/app) while Home Assistant is reading or writing values. Concurrent usage can invalidate sessions and cause wrong reads, failed writes, or stale values.
 
 Custom integration for Home Assistant to read and write values from the local WEM web interface.
 
-Current integration version: 
+Current integration version: 0.2.0
 
 ## HACS Installation
 
+Before adding this integration in Home Assistant, you must enable the web interface on the heater controller:
+
+1. Open the heater settings on the device.
+2. Enter access code `21` or `22`.
+3. Go to `Settings -> Network`.
+4. Enable the web interface.
+5. Do not set it to `Service` mode.
+
+Warning:
+
+- This is done at your own risk.
+- Enabling this interface allows configuration changes that can modify safety-relevant heating behavior.
+- Incorrect changes can cause malfunctions or physical damage to the heating system.
+
 1. In Home Assistant, open HACS.
 2. Go to `Custom repositories`.
-3. Add your repository URL and choose category `Integration`.
+3. Add `https://github.com/KNerzDHBW/ha-weishaupt` and choose category `Integration`.
 4. Install `WEM Web Interface` from HACS.
 5. Restart Home Assistant.
 6. Add the integration in `Settings -> Devices & Services`.
 
 ## Configuration
 
-Configure in the integration UI:
+Configure the integration in Home Assistant under Settings -> Devices & Services:
 
 - IP address or DNS name (e.g. `heizung.home`)
 - Username
 - Password
-- Stack entries (one stack per line) [OPTIONAL]
-- In the configuration of the wem web interface read all entries.
+
+After adding the integration:
+
+- Open the integration options and run the initialization scan.
+- Enable only menus/submenus you actually need.
+- Review all discovered writable entities before changing any value.
 
 ## Initialization During Setup
 
@@ -41,6 +77,7 @@ Important timing note:
 - Full initialization can take several minutes (depending on the number of menus/submenus and request spacing).
 - During this time, the UI may continue to show "Initializing".
 - This is expected behavior; in most cases the run should not be interrupted.
+- Writing values can also take several minutes in some cases (verification and retries).
 
 Note:
 

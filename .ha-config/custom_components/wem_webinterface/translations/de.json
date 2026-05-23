@@ -1,0 +1,103 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "WEM Web Interface einrichten",
+        "description": "Verbindung zum WEM-Gerät konfigurieren.",
+        "data": {
+          "ip_address": "IP-Adresse oder DNS-Name",
+          "username": "Benutzername",
+          "password": "Passwort",
+          "entries": "Stack-Einträge (optional, eine Zeile pro Eintrag)"
+        },
+        "submit": "Automatischen Scan starten"
+      },
+      "autoscan": {
+        "title": "Automatischer Initialisierungs-Scan",
+        "description": "Hauptmenü-Scan {root_done}/{root_total}. Prüfe {root_current_index}/{root_total}: {root_current_label}. Verarbeitete Seiten: {processed}.\n\nDer Scan läuft im Hintergrund weiter. Drücke unten auf den Button, um die weitere Analyse zu überspringen und die Einrichtung sofort fortzusetzen.",
+        "submit": "Analyse überspringen und fortfahren"
+      },
+      "autoscan_summary": {
+        "title": "Automatischer Initialisierungs-Scan",
+        "description": "Scan abgeschlossen. Übersicht der geparsten Hauptmenü-Stacks:\n{summary}",
+        "submit": "Einrichtung abschließen"
+      },
+      "autoscan_failed": {
+        "title": "Automatischer Initialisierungs-Scan",
+        "description": "Der automatische Vollscan ist fehlgeschlagen. Du kannst trotzdem fortfahren und den Scan später über Optionen oder Service starten.",
+        "submit": "Trotzdem fortfahren"
+      }
+    },
+    "progress": {
+      "initial_autoscan": "Hauptmenü-Scan {root_done}/{root_total}. Prüfe {root_current_index}/{root_total}: {root_current_label}. Verarbeitete Seiten: {processed}."
+    },
+    "error": {
+      "entries_empty": "Es muss mindestens ein Stack-Eintrag angegeben werden.",
+      "init_scan_failed": "Automatischer Vollscan fehlgeschlagen. Verbindung prüfen und erneut versuchen."
+    },
+    "abort": {
+      "already_configured": "Gerät ist bereits konfiguriert."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "WEM Optionen",
+        "data": {
+          "cycle_interval": "Zyklusintervall (Sekunden)",
+          "retry_interval": "Wiederholungsintervall bei unvollständiger Seite (Sekunden)",
+          "max_retries": "Maximale Wiederholungsversuche",
+          "entries": "Stack-Einträge (eine Zeile pro Eintrag)",
+          "rediscover_stack": "Einen vorhandenen Eintrag neu einlesen",
+          "init_scan_now": "Jetzt alle Einträge einlesen (einmaliger vollständiger Menü-Scan)",
+          "init_scan_interval": "Scan-Intervall zwischen Seitenabrufen (Sekunden, mindestens 5)",
+          "init_scan_max_entries": "Maximal zu scannende Einträge"
+        },
+        "submit": "Speichern"
+      },
+      "manual_scan_failed": {
+        "title": "Initialisierungs-Scan",
+        "description": "Manueller Vollscan fehlgeschlagen. Du kannst trotzdem fortfahren und die aktuellen Einträge beibehalten.",
+        "submit": "Trotzdem fortfahren"
+      },
+      "manual_scan_summary": {
+        "title": "Initialisierungs-Scan",
+        "description": "Manueller Scan abgeschlossen. Übersicht der geparsten Menüs:\n{summary}",
+        "submit": "Ergebnisse übernehmen"
+      }
+    },
+    "progress": {
+      "manual_init_scan": "Manueller Vollscan läuft (mindestens 5 Sekunden zwischen Seitenabrufen)."
+    },
+    "error": {
+      "entries_empty": "Es muss mindestens ein Stack-Eintrag angegeben werden.",
+      "init_scan_failed": "Automatischer Vollscan fehlgeschlagen. Verbindung prüfen und erneut versuchen."
+    }
+  },
+  "services": {
+    "rediscover": {
+      "name": "Parameter neu entdecken",
+      "description": "Liest Metadaten (Wertebereich, Typ, …) für einen Stack-Eintrag neu aus.",
+      "fields": {
+        "stack": {
+          "name": "Stack",
+          "description": "Der Stack-String, der neu entdeckt werden soll (leer = alle)."
+        }
+      }
+    },
+    "initialize_scan": {
+      "name": "Initialisierungs-Scan",
+      "description": "Einmalige rekursive Erkennung aller verschachtelten Stack-Einträge mit begrenzter Abrufrate.",
+      "fields": {
+        "scan_interval": {
+          "name": "Scan-Intervall",
+          "description": "Sekunden zwischen zwei Stack-Abrufen (mindestens 5)."
+        },
+        "max_entries": {
+          "name": "Maximale Einträge",
+          "description": "Sicherheitsgrenze für die Anzahl der zu verarbeitenden Stacks."
+        }
+      }
+    }
+  }
+}
