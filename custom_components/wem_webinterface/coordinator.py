@@ -94,6 +94,8 @@ class WemCoordinator(DataUpdateCoordinator[dict[str, WemPoint]]):
         self.stack_recoveries: int = 0
         self.consecutive_failures: int = 0
 
+        self.last_read: dict[str, str] = {}
+
         self._point_listeners: list[PointListener] = []
         self._lock = asyncio.Lock()
         self._storage = Store(hass, STORAGE_VERSION, f"{STORAGE_KEY}_{entry.entry_id}")
@@ -781,6 +783,7 @@ class WemCoordinator(DataUpdateCoordinator[dict[str, WemPoint]]):
 
             if not self._is_unknown_runtime_value(parsed_point.value):
                 existing.value = parsed_point.value
+                self.last_read[existing.point_id] = datetime.now(timezone.utc).isoformat()
             existing.unit = parsed_point.unit
             existing.writable = parsed_point.writable
             existing.kind = self._resolve_stable_kind(existing, parsed_point)

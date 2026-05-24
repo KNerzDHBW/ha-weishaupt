@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from homeassistant.components.sensor import SensorEntity
+from datetime import datetime, timezone
+
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
@@ -129,6 +131,7 @@ class WemLastRefreshSensor(SensorEntity):
     _attr_has_entity_name = True
     _attr_name = "Last Refresh"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
 
     def __init__(self, coordinator: WemCoordinator) -> None:
         self.coordinator = coordinator
@@ -139,8 +142,14 @@ class WemLastRefreshSensor(SensorEntity):
         return True
 
     @property
-    def native_value(self):
-        return self.coordinator.last_refresh or "unknown"
+    def native_value(self) -> datetime | None:
+        raw = self.coordinator.last_refresh
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
 
     @property
     def extra_state_attributes(self) -> dict:

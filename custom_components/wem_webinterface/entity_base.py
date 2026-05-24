@@ -40,6 +40,7 @@ class WemPointEntity(CoordinatorEntity[WemCoordinator]):
             "submenu": self.point.submenu,
             "source_stack": self.point.source_stack,
             "writable": self.point.writable,
+            "last_read": self.coordinator.last_read.get(self._point_id),
         }
 
     @property
