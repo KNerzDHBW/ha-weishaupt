@@ -174,6 +174,56 @@ class WemCoordinator(DataUpdateCoordinator[dict[str, WemPoint]]):
         self.async_update_listeners()
 
     @staticmethod
+    def _numeric_tokens_from_option_labels(labels: list[str]) -> list[float]:
+        values: list[float] = []
+        for label in labels:
+            match = re.search(r"[+-]?[0-9]+(?:[.,][0-9]+)?", str(label or ""))
+            if match is None:
+                return []
+            try:
+                values.append(float(match.group(0).replace(",", ".")))
+            except (TypeError, ValueError):
+                return []
+        return values
+
+    @staticmethod
+    def _detect_step_from_values(values: list[float]) -> float | None:
+        uniq = sorted(set(values))
+        if len(uniq) < 2:
+            return None
+        steps = [b - a for a, b in zip(uniq, uniq[1:]) if (b - a) > 1e-9]
+        if not steps:
+            return None
+        return min(steps)
+
+    def _upgrade_kind_from_write_spec(self, point: WemPoint) -> None:
+        """Upgrade legacy text points when write metadata proves select/number behavior."""
+        if not point.writable or point.write_spec is None:
+            return
+
+        labels = list(point.write_spec.select_value_map.keys())
+        if not labels:
+            return
+
+        numeric_values = self._numeric_tokens_from_option_labels(labels)
+        if numeric_values and len(numeric_values) == len(labels):
+            point.kind = "number"
+            if point.min_value is None:
+                point.min_value = min(numeric_values)
+            if point.max_value is None:
+                point.max_value = max(numeric_values)
+            if point.step is None:
+                point.step = self._detect_step_from_values(numeric_values)
+            if not point.options:
+                point.options = labels
+            return
+
+        # Non-numeric option list is still a select, never plain text.
+        point.kind = "select"
+        if not point.options:
+            point.options = labels
+
+    @staticmethod
     def _is_unknown_runtime_value(value: Any) -> bool:
         """Return True for placeholder/empty values that should not replace known state."""
         if value is None:
@@ -435,6 +485,9 @@ class WemCoordinator(DataUpdateCoordinator[dict[str, WemPoint]]):
         if not restored_points:
             return False
 
+        for point in restored_points.values():
+            self._upgrade_kind_from_write_spec(point)
+
         self.points = restored_points
         self.points = self._deduplicate_points_by_logical_key(self.points)
         self.page_targets = restored_pages
@@ -486,6 +539,7 @@ class WemCoordinator(DataUpdateCoordinator[dict[str, WemPoint]]):
             )
             existing.step = discovered_point.step if discovered_point.step is not None else existing.step
             existing.write_spec = discovered_point.write_spec or existing.write_spec
+            self._upgrade_kind_from_write_spec(existing)
 
         return self._deduplicate_points_by_logical_key(merged)
 
@@ -737,6 +791,7 @@ class WemCoordinator(DataUpdateCoordinator[dict[str, WemPoint]]):
             existing.max_value = parsed_point.max_value if parsed_point.max_value is not None else existing.max_value
             existing.step = parsed_point.step if parsed_point.step is not None else existing.step
             existing.write_spec = parsed_point.write_spec or existing.write_spec
+            self._upgrade_kind_from_write_spec(existing)
 
     def _find_point_id_by_logical_name(self, menu: str, submenu: str, name: str) -> str | None:
         wanted = self._logical_key(menu, submenu, name)

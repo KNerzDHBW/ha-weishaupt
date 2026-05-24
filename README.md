@@ -1,8 +1,8 @@
-# WEM Web Interface (Home Assistant), v0.2.1
+# WEM Web Interface (Home Assistant), v0.2.2
 
 Custom integration for Home Assistant to read and write values from the *local* WEM webserver.
 
-Current integration version: 0.2.1
+Current integration version: 0.2.2
 
 ## Warning
 
