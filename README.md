@@ -10,16 +10,16 @@ This project documentation and code were created with GitHub Copilot (GPT-5.3-Co
 No guarantee is provided for correctness, completeness, or safety.
 
 Use this integration at your own risk.
-It could accidentially set heating parameters to wrong operating values and may cause malfunctions or physical damage to the heating system.
-This could happen without explicitly setting it, just by a bug of the Copilot Code.
+It could accidentally set heating parameters to wrong operating values and may cause malfunctions or physical damage to the heating system.
+This could happen without explicitly setting it, just by a bug in the Copilot code.
 
 ## Operational Limitations
 
 - Reading and writing values is not done in real-time. Depending on polling interval, request spacing, and verification retries, applying or updating a new value can take minutes.
-- The Weishaupt web interface is highly unstable (at least for some machines). Intermittent page load failures, incomplete pages, and temporary login failures are expected. Parallel access often leads to incorrect responses which easily can lead to wrong values been set.
+- The Weishaupt web interface is highly unstable (at least for some machines). Intermittent page load failures, incomplete pages, and temporary login failures are expected. Parallel access often leads to incorrect responses which easily can lead to wrong values being set.
 - To reduce errors, the integration performs updates with pauses between requests and retries failed operations.
 - Do not use the Weishaupt web interface in parallel (browser) while Home Assistant is reading or writing values. Concurrent usage can invalidate sessions and cause wrong reads, failed writes, or stale values.
-- Setup username/passwort via the Webinterface (see below) before starting the Addon for the first time.
+- Set up username/password via the webinterface (see below) before starting the AddOn for the first time.
 
 
 ## Activating the Webserver
@@ -42,8 +42,8 @@ Before adding this integration in Home Assistant, you must enable the webserver 
 **Note:**
 At least for some devices, this webserver is **really** unstable.
 * It crashes sometimes if it got too many accesses.
-* It answeres sometimes with only parts of the real page or with just the wrong page.
-* It cannot handle simultianious accesses
+* It sometimes answers with only parts of a page or serves the wrong page entirely.
+* It cannot handle simultaneous accesses
 * ...
 
 Use it with real care!
@@ -112,11 +112,11 @@ This can take a minute (without showing any log!) as each entry has additional i
 
 ### Final Touches
 
-Go into the newly created integration and **disable all writeable entries which could harm your heater, all you do not understand, all not supported by the plugin** (e.g. times and dates or value is "unkown"), and all you are not interested in.
+Go into the newly created integration and **disable all writeable entries which could harm your heater, all you do not understand, all not supported by the plugin** (e.g. times and dates or value is "unknown"), and all you are not interested in.
 
-This does **not** prevent that bugs in this AddOn or the Webserver overwrite these values, but it makes it less likely.
+This does **not** prevent bugs in this AddOn or the webserver from overwriting these values, but it makes it less likely.
 
-Go to the settings of the Integration and **disable all sub-menu entries which could harm your heater, all you do not understand, all not supported by the plugin** (e.g. times and dates or value is "unkown"), and all you are not interested in.
+Go to the settings of the Integration and **disable all sub-menu entries which could harm your heater, all you do not understand, all not supported by the plugin** (e.g. times and dates or value is "unknown"), and all you are not interested in.
 
 ## Duplicate Entities Cleanup
 
@@ -137,7 +137,7 @@ Recommended usage:
 ## Further Restrictions
 
 * Dates, Times, and other entries are not supported.
-* Between setting values a short waiting time should be considered. For exmple waiting two seconds between setting two values.
+* Between setting values a short waiting time should be considered. For example, wait two seconds between setting two values.
 
 ## Notes
 
