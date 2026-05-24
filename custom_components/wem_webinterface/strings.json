@@ -8,7 +8,7 @@
           "base_url": "Base URL",
           "username": "Username",
           "password": "Password",
-          "wait_seconds": "Minimum request spacing (seconds)"
+          "wait_seconds": "Minimum request pause (seconds)"
         },
         "submit": "Log in and continue"
       },
@@ -61,7 +61,7 @@
           "base_url": "Base URL",
           "username": "Username",
           "password": "Password",
-          "wait_seconds": "Minimum request spacing (seconds)",
+          "wait_seconds": "Minimum request pause (seconds)",
           "scan_interval": "Update interval (seconds)",
           "disabled_menus": "Disabled menus",
           "disabled_submenus": "Disabled submenus"

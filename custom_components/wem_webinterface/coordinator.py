@@ -173,6 +173,59 @@ class WemCoordinator(DataUpdateCoordinator[dict[str, WemPoint]]):
         self.last_update_page = f"setup: {phase}"
         self.async_update_listeners()
 
+    @staticmethod
+    def _is_unknown_runtime_value(value: Any) -> bool:
+        """Return True for placeholder/empty values that should not replace known state."""
+        if value is None:
+            return True
+        if isinstance(value, str):
+            norm = value.strip().lower()
+            return norm in {"", "unknown", "n/a", "none", "nan"}
+        return False
+
+    @staticmethod
+    def _is_numeric_select_point(point: WemPoint) -> bool:
+        """Return True if select options are all numeric-like labels."""
+        if point.write_spec is None or not point.write_spec.select_value_map:
+            return False
+        option_labels = list(point.write_spec.select_value_map.keys())
+        if not option_labels:
+            return False
+
+        for label in option_labels:
+            text = str(label or "").strip()
+            match = re.search(r"[+-]?[0-9]+(?:[.,][0-9]+)?", text)
+            if match is None:
+                return False
+            try:
+                float(match.group(0).replace(",", "."))
+            except (TypeError, ValueError):
+                return False
+
+        return True
+
+    @staticmethod
+    def _resolve_stable_kind(existing: WemPoint, incoming: WemPoint) -> str:
+        """Prefer stable writable kinds over transient text-only parses."""
+        existing_kind = str(existing.kind or "").strip().lower()
+        incoming_kind = str(incoming.kind or "").strip().lower()
+
+        if incoming_kind == "select":
+            if existing_kind == "number" and WemCoordinator._is_numeric_select_point(existing):
+                return "number"
+            return "select"
+        if incoming_kind == "number":
+            return "number"
+
+        # Parsed pages often expose writable entries as generic text links.
+        # Keep previously classified writable types unless explicitly reclassified.
+        if incoming_kind == "text" and existing_kind in {"select", "number"}:
+            return existing_kind
+
+        if incoming_kind:
+            return incoming_kind
+        return existing_kind or "text"
+
     def _opt(self, key: str, default: Any) -> Any:
         if key in self.entry.options:
             return self.entry.options[key]
@@ -413,10 +466,11 @@ class WemCoordinator(DataUpdateCoordinator[dict[str, WemPoint]]):
                 existing = merged[existing_id]
 
             existing.source_stack = discovered_point.source_stack or existing.source_stack
-            existing.value = discovered_point.value
+            if not self._is_unknown_runtime_value(discovered_point.value):
+                existing.value = discovered_point.value
             existing.unit = discovered_point.unit
             existing.writable = discovered_point.writable
-            existing.kind = discovered_point.kind
+            existing.kind = self._resolve_stable_kind(existing, discovered_point)
             existing.editor_stack = discovered_point.editor_stack or existing.editor_stack
             if discovered_point.options:
                 existing.options = discovered_point.options
@@ -671,10 +725,11 @@ class WemCoordinator(DataUpdateCoordinator[dict[str, WemPoint]]):
                 existing = self.points[existing_key]
                 existing.source_stack = active_stack
 
-            existing.value = parsed_point.value
+            if not self._is_unknown_runtime_value(parsed_point.value):
+                existing.value = parsed_point.value
             existing.unit = parsed_point.unit
             existing.writable = parsed_point.writable
-            existing.kind = parsed_point.kind
+            existing.kind = self._resolve_stable_kind(existing, parsed_point)
             existing.editor_stack = parsed_point.editor_stack or existing.editor_stack
             if parsed_point.options:
                 existing.options = parsed_point.options

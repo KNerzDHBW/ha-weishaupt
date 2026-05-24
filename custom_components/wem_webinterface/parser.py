@@ -114,6 +114,23 @@ def _extract_numeric_token(value: Any) -> float | None:
     return _to_float(match.group(0))
 
 
+def _detect_numeric_step(values: list[float]) -> float | None:
+    """Return smallest positive distance between sorted numeric values."""
+    unique_sorted = sorted(set(values))
+    if len(unique_sorted) < 2:
+        return None
+
+    diffs: list[float] = []
+    for left, right in zip(unique_sorted, unique_sorted[1:]):
+        diff = right - left
+        if diff > 1e-9:
+            diffs.append(diff)
+
+    if not diffs:
+        return None
+    return min(diffs)
+
+
 def _resolve_select_post_value(
     requested_value: Any,
     select_value_map: dict[str, str],
@@ -556,6 +573,25 @@ class WemWebClient:
                     raw_value = str(raw_attr).strip() if raw_attr is not None else ""
                     # HTML select submits option text if no explicit value attribute is set.
                     select_value_map[txt] = raw_value or txt
+
+            numeric_tokens = [_extract_numeric_token(text) for text in options]
+            all_numeric = bool(options) and all(token is not None for token in numeric_tokens)
+            if all_numeric:
+                numeric_values = [float(token) for token in numeric_tokens if token is not None]
+                return {
+                    "kind": "number",
+                    "min": min(numeric_values) if numeric_values else None,
+                    "max": max(numeric_values) if numeric_values else None,
+                    "step": _detect_numeric_step(numeric_values),
+                    "options": options,
+                }, WriteSpec(
+                    action_url,
+                    hidden_fields,
+                    value_field,
+                    scaling_factor=1.0,
+                    select_value_map=select_value_map,
+                )
+
             return {"kind": "select", "options": options}, WriteSpec(
                 action_url,
                 hidden_fields,

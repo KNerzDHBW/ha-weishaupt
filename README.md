@@ -1,103 +1,122 @@
-# WEM Web Interface (Home Assistant), v0.2.0
+# WEM Web Interface (Home Assistant), v0.2.1
+
+Custom integration for Home Assistant to read and write values from the *local* WEM webserver.
+
+Current integration version: 0.2.1
 
 ## Warning
 
-This project documentation and large parts of the code were created with GitHub Copilot (GPT-5.3-Codex).
+This project documentation and code were created with GitHub Copilot (GPT-5.3-Codex). I have no clue what it did, but it is working on my machine.
 No guarantee is provided for correctness, completeness, or safety.
 
 Use this integration at your own risk.
-Incorrect writes to heating parameters can set wrong operating values and may cause malfunctions or physical damage to the heating system.
-This could happen accidential due to implementation bugs by Copilot.
-
-Always verify discovered entities and writable values against official device documentation before enabling write access.
+It could accidentially set heating parameters to wrong operating values and may cause malfunctions or physical damage to the heating system.
+This could happen without explicitly setting it, just by a bug of the Copilot Code.
 
 ## Operational Limitations
 
-- Writing values is not real-time. Depending on polling interval, request spacing, and verification retries, applying a new value can take several minutes.
-- The Weishaupt web interface is partly unstable. Intermittent page load failures, incomplete pages, and temporary login failures are expected.
-- To reduce errors, the integration performs updates with spacing between requests and retries failed operations.
-- Do not use the Weishaupt web interface in parallel (browser/app) while Home Assistant is reading or writing values. Concurrent usage can invalidate sessions and cause wrong reads, failed writes, or stale values.
+- Reading and writing values is not done in real-time. Depending on polling interval, request spacing, and verification retries, applying or updating a new value can take minutes.
+- The Weishaupt web interface is highly unstable (at least for some machines). Intermittent page load failures, incomplete pages, and temporary login failures are expected. Parallel access often leads to incorrect responses which easily can lead to wrong values been set.
+- To reduce errors, the integration performs updates with pauses between requests and retries failed operations.
+- Do not use the Weishaupt web interface in parallel (browser) while Home Assistant is reading or writing values. Concurrent usage can invalidate sessions and cause wrong reads, failed writes, or stale values.
+- Setup username/passwort via the Webinterface (see below) before starting the Addon for the first time.
 
-Custom integration for Home Assistant to read and write values from the local WEM web interface.
 
-Current integration version: 0.2.0
+## Activating the Webserver
 
-## HACS Installation
-
-Before adding this integration in Home Assistant, you must enable the web interface on the heater controller:
+Before adding this integration in Home Assistant, you must enable the webserver on the heater controller:
 
 1. Open the heater settings on the device.
-2. Enter access code `21` or `22`.
-3. Go to `Settings -> Network`.
-4. Enable the web interface.
-5. Do not set it to `Service` mode.
+2. Switch to OEM mode (code `21`).
+   **You do this on your own risk! This might break your heater!**
+3. Enable the Webserver in `Settings` -> `Webserver`.
+4. Enable it (not service!).
+5. Login to the webinterface - ip address of your heater (can be seen in `Settings` -> `TCP/IP`) - and set username and password.
 
-Warning:
+**Warning:**
 
 - This is done at your own risk.
 - Enabling this interface allows configuration changes that can modify safety-relevant heating behavior.
 - Incorrect changes can cause malfunctions or physical damage to the heating system.
+
+**Note:**
+At least for some devices, this webserver is **really** unstable.
+* It crashes sometimes if it got too many accesses.
+* It answeres sometimes with only parts of the real page or with just the wrong page.
+* It cannot handle simultianious accesses
+* ...
+
+Use it with real care!
+
+## Installing the AddOn in HACS
+
+If you do not have HACS in Home Assistant, then install it.
+If you cannot find how, you should not use this AddOn. (Sorry for being blunt)
 
 1. In Home Assistant, open HACS.
 2. Go to `Custom repositories`.
 3. Add `https://github.com/KNerzDHBW/ha-weishaupt` and choose category `Integration`.
 4. Install `WEM Web Interface` from HACS.
 5. Restart Home Assistant.
-6. Add the integration in `Settings -> Devices & Services`.
 
 ## Configuration
 
-Configure the integration in Home Assistant under Settings -> Devices & Services:
+**Warning:**
+The configuration can easily take ten minutes with manual steps in between!
+
+### Start Integration Configuration
+Add the integration WEM Web Interface in `Settings` -> `Devices & Services`.
+Insert
 
 - IP address or DNS name (e.g. `heizung.home`)
 - Username
 - Password
+- Minimum request pause (see instability of webserver)
 
-After adding the integration:
+### Read All Main-Menu Entries
 
-- Open the integration options and run the initialization scan.
-- Enable only menus/submenus you actually need.
-- Review all discovered writable entities before changing any value.
+Now, the AddOn will try to connect to the heater and read the main menu of all entries to be read.
+In the next window, the currently processed step can be seen.
+As I couldn't figure out, how to automatically update the log windows (Copilot...), so you have to update the window by clicking "Refresh Log Data".
+You need to do this in order to come to the next step (sorry).
 
-## Initialization During Setup
+This can take one or two minutes!
 
-During first-time setup, the integration runs a multi-step initialization flow. The steps run in sequence:
+It might result in an error (incorrect username/password) even if the data is correct (Webinterface is unstable).
+Just retry. If it fails too often, make sure url, username, and password are correct and try a higher minimum request pause.
 
-1. Establish connection and verify login.
-2. Read available main menus.
-3. Recursively scan selected main menus and submenus.
-4. Collect and classify discovered points.
-5. `Finalizing writable items: x/y`: inspect writable entries one by one (type, min/max/step, options, and write metadata).
-6. Persist results and create entities in Home Assistant.
+### Choose active menu entries
 
-Important timing note:
+The next step is to choose the main menu entries to be used.
+As the refresh rate depends on the amount of entries to be read and writing is unstable, disable all menu items, you do not want to read/write.
 
-- While initializing the first time, a dialog is kept open. Pressing the button will update the log information (no idea how to do that correctly). As soon as the reading is done, the button will step to the next step.
-- The last step takes a minute without showing anything but an empty page. Sorry about that.
-- Full initialization can take several minutes (depending on the number of menus/submenus and request spacing).
-- During this time, the UI may continue to show "Initializing".
-- This is expected behavior; in most cases the run should not be interrupted.
-- Writing values can also take several minutes in some cases (verification and retries).
+*Disable at least `Inputs`, `Outputs`, and `Settings` as changing them could be really harmful to your heating system.*
 
-Note:
+Afterwards the AddOn will try to process each menu entry, read all sub-menu entries. This takes quite some time (in particular with long request pause), as each sub-menu entry has to be processed separately.
 
-- The status window shows newest messages first (`Latest first (newest at top):`).
+Again you can "Refresh Log Data" to see what is happening. You'll see a list of all entries which are found.
 
-## Why It Continues After Finish
+**Warning:** If you see corrupt information, cancel and restart (again, instabile webserver).
 
-After clicking `Finish`, Home Assistant still performs the normal config entry setup lifecycle.
+After all sub-menu items are read, the AddOn will read the information for each writable entries which again has to open each writeable entry.
+This will be shown as "Finalizing writable items".
+And again, this takes times depending on the pause time.
 
-This is expected and consists of two distinct phases:
+Again: You have to refresh the log data to come to the next step.
+When it is done, you can click "Finish"
 
-1. Config flow phase: the dialog collects credentials/options and performs the interactive initialization scan.
-2. Entry setup phase: Home Assistant loads the integration, forwards platforms, restores cached/bootstrapped data, and makes entities available.
+### Finalization
 
-So even if the scan in the dialog already finished, there can still be a short "Initializing" period while Home Assistant activates the entry.
+Home Assistant persists the results, creates entities etc.
+This can take a minute (without showing any log!) as each entry has additional information about the url where to find it (which by the way changes for some reason).
 
-Performance note:
+### Final Touches
 
-- The integration now passes bootstrap scan data from the config flow into entry setup whenever possible.
-- This avoids a second full discovery in most cases and reduces the post-Finish waiting time.
+Go into the newly created integration and **disable all writeable entries which could harm your heater, all you do not understand, all not supported by the plugin** (e.g. times and dates or value is "unkown"), and all you are not interested in.
+
+This does **not** prevent that bugs in this AddOn or the Webserver overwrite these values, but it makes it less likely.
+
+Go to the settings of the Integration and **disable all sub-menu entries which could harm your heater, all you do not understand, all not supported by the plugin** (e.g. times and dates or value is "unkown"), and all you are not interested in.
 
 ## Duplicate Entities Cleanup
 
@@ -114,10 +133,11 @@ Recommended usage:
 2. Open Developer Tools -> Services.
 3. Run `wem_webinterface.cleanup_duplicates`.
 
-Note:
 
-- New duplicate creation is prevented by stable logical matching in the integration.
-- This service is intended to remove already existing duplicates from the entity registry.
+## Further Restrictions
+
+* Dates, Times, and other entries are not supported.
+* Between setting values a short waiting time should be considered. For exmple waiting two seconds between setting two values.
 
 ## Notes
 
